@@ -18,6 +18,7 @@ use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
+
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::Keycode;
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -33,7 +34,7 @@ use smithay::backend::renderer::element::{
 };
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::{Color32F, Renderer, TextureFilter};
 use smithay::desktop::utils::{
     bbox_from_surface_tree, output_update, send_dmabuf_feedback_surface_tree,
     send_frames_surface_tree, surface_presentation_feedback_flags_from_states,
@@ -4019,6 +4020,18 @@ impl Niri {
         }
     }
 
+    pub fn render_for_color_pick<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+    ) -> Vec<OutputRenderElements<R>> {
+        let mut elements = Vec::new();
+        self.render_inner(renderer, output, false, RenderTarget::Output, &mut |elem| {
+            elements.push(elem)
+        });
+        elements
+    }
+
     pub fn render<R: NiriRenderer>(
         &self,
         renderer: &mut R,
@@ -4027,14 +4040,106 @@ impl Niri {
         target: RenderTarget,
     ) -> Vec<OutputRenderElements<R>> {
         let mut elements = Vec::new();
+
+        // Apply cursor zoom to all elements except the cursor itself
+        // if cursor zoom is active. Per-monitor like overview zoom.
+        let cursor_zoom_factor = self
+            .layout
+            .monitor_for_output(output)
+            .map(|m| m.cursor_zoom_factor)
+            .unwrap_or(1.0);
+
+        if cursor_zoom_factor > 1.0 {
+            let zoom_quality = self.config.borrow().cursor.zoom_quality;
+            // Nearest-neighbor filtering must be set before DRM compositor renders.
+            // Reset to Linear for smooth mode, or set to Nearest for pixel-perfect.
+            let filter = TextureFilter::from(zoom_quality);
+            let gles = renderer.as_gles_renderer();
+            let _ = gles.upscale_filter(filter).map_err(|err| {
+                warn!("error setting upscale filter: {err:?}");
+            });
+            let _ = gles.downscale_filter(filter).map_err(|err| {
+                warn!("error setting downscale filter: {err:?}");
+            });
+        }
+
         self.render_inner(renderer, output, include_pointer, target, &mut |elem| {
             elements.push(elem)
         });
 
+        let output_scale = Scale::from(output.current_scale().fractional_scale());
         if self.debug_draw_opaque_regions {
-            let output_scale = Scale::from(output.current_scale().fractional_scale());
             draw_opaque_regions(&mut elements, output_scale);
         }
+
+        let elements = if cursor_zoom_factor > 1.0 {
+            let monitor = self.layout.monitor_for_output(output).unwrap();
+            let output_geo = self.global_space.output_geometry(output).unwrap();
+            let output_size = output_geo.size.to_f64();
+            let output_rect = Rectangle::new(Point::new(0., 0.), output_size);
+
+            let zoom_center = match monitor.cursor_zoom_center_behavior {
+                niri_ipc::ZoomBehavior::Cursor => {
+                    let pointer = self.seat.get_pointer().unwrap();
+                    let cursor_pos = pointer.current_location();
+                    cursor_pos - output_geo.loc.to_f64()
+                }
+                niri_ipc::ZoomBehavior::EdgePushed => monitor.cursor_zoom_center,
+            };
+
+            let pointer_scaling = self.config.borrow().cursor.pointer_scaling;
+
+            // Apply zoom to a OutputRenderElement variant.
+            macro_rules! zoom_variant {
+                ($elem:expr) => {
+                    apply_cursor_zoom(
+                        $elem,
+                        output_scale,
+                        cursor_zoom_factor,
+                        zoom_center,
+                        output_rect,
+                    )
+                };
+            }
+
+            // Generate match arms for each OutputRenderElement variant that should be zoomed.
+            macro_rules! process_zoom {
+                ($elem:expr, $($variant:ident),*) => {
+                    match $elem {
+                        OutputRenderElements::Pointer(elem) if pointer_scaling => {
+                            zoom_variant!(elem).map(Into::into).into()
+                        }
+                        $(
+                            OutputRenderElements::$variant(elem) => {
+                                zoom_variant!(elem).map(Into::into).into()
+                            }
+                        )*
+                        // Other elements pass through unchanged
+                        _ => Some($elem),
+                    }
+                };
+            }
+
+            elements
+                .into_iter()
+                .filter_map(|elem| {
+                    process_zoom!(
+                        elem,
+                        Monitor,
+                        RescaledTile,
+                        LayerSurface,
+                        Wayland,
+                        SolidColor,
+                        ExitConfirmDialog,
+                        Texture,
+                        RelocatedColor,
+                        RelocatedLayerSurface
+                    )
+                })
+                .collect()
+        } else {
+            elements
+        };
 
         elements
     }
@@ -4225,10 +4330,16 @@ impl Niri {
             mon.render_insert_hint_between_workspaces(renderer, &mut |elem| push(elem.into()));
 
             // Macro instead of closure to avoid borrowing push().
+            // When zoom == 1.0 (no overview zoom), push elements directly without
+            // wrapping in Relocated* types, so cursor zoom post-processing can handle them.
             macro_rules! process {
                 ($geo:expr) => {{
                     &mut |elem| {
-                        if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, $geo) {
+                        if zoom == 1.0 {
+                            push(elem.into());
+                        } else if let Some(elem) =
+                            scale_relocate_crop(elem, output_scale, zoom, $geo)
+                        {
                             push(elem.into());
                         }
                     }
@@ -4246,7 +4357,12 @@ impl Niri {
                 push_normal_from_layer!(Layer::Bottom, process!(geo));
                 push_normal_from_layer!(Layer::Background, process!(geo));
 
-                process!(geo)(ws.render_background());
+                let bg = ws.render_background();
+                if zoom == 1.0 {
+                    push(bg.into());
+                } else if let Some(elem) = scale_relocate_crop(bg, output_scale, zoom, geo) {
+                    push(elem.into());
+                }
             }
         }
 
@@ -4259,6 +4375,7 @@ impl Niri {
         push(backdrop);
     }
 
+    /// Renders the output with cursor zoom applied.
     fn layers_in_render_order<'a>(
         &'a self,
         layer_map: &'a LayerMap,
@@ -6124,6 +6241,30 @@ fn scale_relocate_crop<E: Element>(
     CropRenderElement::from_element(elem, output_scale, ws_geo)
 }
 
+fn apply_cursor_zoom<E: Element>(
+    element: E,
+    output_scale: Scale<f64>,
+    zoom: f64,
+    cursor_pos: Point<f64, Logical>,
+    output_geo: Rectangle<f64, Logical>,
+) -> Option<CropRenderElement<RelocateRenderElement<RescaleRenderElement<E>>>> {
+    let offset_x = (cursor_pos.x * (1.0 - zoom)) as i32;
+    let offset_y = (cursor_pos.y * (1.0 - zoom)) as i32;
+    let physical_offset = Point::<i32, Physical>::from((
+        (offset_x as f64 * output_scale.x) as i32,
+        (offset_y as f64 * output_scale.y) as i32,
+    ));
+    let scaled = RescaleRenderElement::from_element(element, (0, 0).into(), zoom);
+    let relocated =
+        RelocateRenderElement::from_element(scaled, physical_offset, Relocate::Relative);
+
+    CropRenderElement::from_element(
+        relocated,
+        output_scale,
+        output_geo.to_physical_precise_round(output_scale),
+    )
+}
+
 niri_render_elements! {
     PointerRenderElements<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
@@ -6143,12 +6284,6 @@ niri_render_elements! {
         Monitor = MonitorRenderElement<R>,
         RescaledTile = RescaleRenderElement<TileRenderElement<R>>,
         LayerSurface = LayerSurfaceRenderElement<R>,
-        RelocatedLayerSurface = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
-            LayerSurfaceRenderElement<R>
-        >>>,
-        RelocatedColor = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
-            SolidColorRenderElement
-        >>>,
         Pointer = PointerRenderElements<R>,
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
@@ -6156,7 +6291,43 @@ niri_render_elements! {
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
+
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
+
+        RelocatedMonitor = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            MonitorRenderElement<R>
+        >>>,
+        RelocatedTile = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            RescaleRenderElement<TileRenderElement<R>>
+        >>>,
+        RelocatedLayerSurface = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            LayerSurfaceRenderElement<R>
+        >>>,
+        RelocatedPointer = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            PointerRenderElements<R>
+        >>>,
+        RelocatedWayland = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            WaylandSurfaceRenderElement<R>
+        >>>,
+        RelocatedColor = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            SolidColorRenderElement
+        >>>,
+        RelocatedExitConfirmDialog = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            ExitConfirmDialogRenderElement
+        >>>,
+        RelocatedTexture = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            PrimaryGpuTextureRenderElement
+        >>>,
+        ReRelocatedColor = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+                SolidColorRenderElement
+            >>
+        >>>>,
+        ReRelocatedLayerSurface = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+                LayerSurfaceRenderElement<R>
+            >>
+        >>>>,
     }
 }
