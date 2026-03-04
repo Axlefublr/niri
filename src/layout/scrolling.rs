@@ -1265,9 +1265,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     view_config,
                 );
             }
-        } else {
+        } else if column_idx == self.active_column_idx {
             self.activate_column_with_anim_config(
-                min(self.active_column_idx, self.columns.len() - 1),
+                min(
+                    self.active_column_idx.saturating_sub(1),
+                    self.columns.len() - 1,
+                ),
                 view_config,
             );
         }
