@@ -174,6 +174,9 @@ pub enum MruScope {
     Output,
     /// Windows on the active workspace.
     Workspace,
+    Custom,
+    Docs,
+    Urgent,
 }
 
 #[derive(knuffel::DecodeScalar, Clone, Copy, Debug, Default, PartialEq)]

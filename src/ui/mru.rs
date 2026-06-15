@@ -74,7 +74,14 @@ const FONT: &str = "sans 18px";
 /// Scopes in the order they are cycled through.
 ///
 /// Count must match one defined in `generate_scope_panels()`.
-static SCOPE_CYCLE: [MruScope; 3] = [MruScope::All, MruScope::Workspace, MruScope::Output];
+static SCOPE_CYCLE: [MruScope; 6] = [
+    MruScope::All,
+    MruScope::Workspace,
+    MruScope::Output,
+    MruScope::Custom,
+    MruScope::Docs,
+    MruScope::Urgent,
+];
 
 /// Window MRU traversal context.
 #[derive(Debug)]
@@ -196,7 +203,7 @@ struct TitleTexture {
 #[derive(Debug, Default)]
 struct ScopePanel {
     scale: f64,
-    textures: Option<Option<[MruTexture; 3]>>,
+    textures: Option<Option<[MruTexture; 6]>>,
 }
 
 #[derive(Debug)]
@@ -209,6 +216,10 @@ struct Thumbnail {
     on_current_workspace: bool,
     /// Whether the window is on the current MRU output.
     on_current_output: bool,
+    custom_scope_exclude: bool,
+    docs_scope_include: bool,
+    is_urgent: bool,
+    is_focused: bool,
 
     /// Cached app ID of the window.
     ///
@@ -228,6 +239,11 @@ struct Thumbnail {
 
 impl Thumbnail {
     fn from_mapped(mapped: &Mapped, clock: Clock, config: niri_config::MruPreviews) -> Self {
+        let is_focused = mapped.is_focused();
+        let is_urgent = mapped.is_urgent();
+        let resolved_rules = mapped.rules();
+        let custom_scope_exclude = resolved_rules.custom_scope_exclude.unwrap_or_default();
+        let docs_scope_include = resolved_rules.docs_scope_include.unwrap_or_default();
         let app_id = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
 
         let background = FocusRing::new(niri_config::FocusRing {
@@ -247,6 +263,10 @@ impl Thumbnail {
             timestamp: mapped.get_focus_timestamp(),
             on_current_output: false,
             on_current_workspace: false,
+            is_urgent,
+            is_focused,
+            custom_scope_exclude,
+            docs_scope_include,
             app_id,
             size: mapped.size(),
             clock,
@@ -835,6 +855,9 @@ fn matches(scope: MruScope, app_id_filter: Option<&str>, thumbnail: &Thumbnail) 
         MruScope::All => true,
         MruScope::Output => thumbnail.on_current_output,
         MruScope::Workspace => thumbnail.on_current_workspace,
+        MruScope::Custom => !thumbnail.custom_scope_exclude || thumbnail.is_focused,
+        MruScope::Docs => thumbnail.docs_scope_include || thumbnail.is_focused,
+        MruScope::Urgent => thumbnail.is_urgent || thumbnail.is_focused,
     };
     if !x {
         return false;
@@ -1238,6 +1261,9 @@ impl WindowMruUi {
             MruScope::All => "all",
             MruScope::Output => "output",
             MruScope::Workspace => "workspace",
+            MruScope::Custom => "custom",
+            MruScope::Docs => "docs",
+            MruScope::Urgent => "urgent",
         };
         format!("Scope {scope}")
     }
@@ -1695,7 +1721,7 @@ impl ScopePanel {
 fn generate_scope_panels(
     renderer: &mut GlesRenderer,
     scale: f64,
-) -> anyhow::Result<[MruTexture; 3]> {
+) -> anyhow::Result<[MruTexture; 6]> {
     fn make_panel_text(idx: usize) -> String {
         let span_unselected = "<span fgcolor='#999999'>";
         let span_end = "</span>";
@@ -1715,6 +1741,9 @@ fn generate_scope_panels(
                 MruScope::All => format!("{span_shortcut}A{span_shortcut_end}ll"),
                 MruScope::Output => format!("{span_shortcut}O{span_shortcut_end}utput"),
                 MruScope::Workspace => format!("{span_shortcut}W{span_shortcut_end}orkspace"),
+                MruScope::Custom => format!("{span_shortcut}C{span_shortcut_end}ustom"),
+                MruScope::Docs => format!("{span_shortcut}D{span_shortcut_end}ocs"),
+                MruScope::Urgent => format!("{span_shortcut}U{span_shortcut_end}rgent"),
             };
             buf.push_str(&text);
             if scope as usize != idx {
@@ -1730,6 +1759,9 @@ fn generate_scope_panels(
         render_panel(renderer, scale, &make_panel_text(0))?,
         render_panel(renderer, scale, &make_panel_text(1))?,
         render_panel(renderer, scale, &make_panel_text(2))?,
+        render_panel(renderer, scale, &make_panel_text(3))?,
+        render_panel(renderer, scale, &make_panel_text(4))?,
+        render_panel(renderer, scale, &make_panel_text(5))?,
     ])
 }
 
