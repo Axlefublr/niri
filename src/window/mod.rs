@@ -76,6 +76,9 @@ pub struct ResolvedWindowRules {
     /// Whether the window should receive focus on xdg-activation requests.
     pub focus_on_xdg_activate: Option<bool>,
 
+    pub custom_scope_exclude: Option<bool>,
+    pub docs_scope_include: Option<bool>,
+
     /// Extra bound on the minimum window width.
     pub min_width: Option<u16>,
     /// Extra bound on the minimum window height.
@@ -262,6 +265,14 @@ impl ResolvedWindowRules {
 
                 if let Some(x) = rule.focus_on_xdg_activate {
                     resolved.focus_on_xdg_activate = Some(x);
+                }
+
+                if let Some(x) = rule.custom_scope_exclude {
+                    resolved.custom_scope_exclude = Some(x);
+                }
+
+                if let Some(x) = rule.docs_scope_include {
+                    resolved.docs_scope_include = Some(x);
                 }
 
                 if let Some(x) = rule.min_width {
