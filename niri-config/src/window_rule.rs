@@ -36,6 +36,10 @@ pub struct WindowRule {
     pub open_focused: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub focus_on_xdg_activate: Option<bool>,
+    #[knuffel(child, unwrap(argument))]
+    pub custom_scope_exclude: Option<bool>,
+    #[knuffel(child, unwrap(argument))]
+    pub docs_scope_include: Option<bool>,
 
     // Rules applied dynamically.
     #[knuffel(child, unwrap(argument))]
