@@ -2356,6 +2356,11 @@ impl State {
                 filter,
             } => {
                 if self.niri.window_mru_ui.is_open() {
+                    if let Some(scope) = scope {
+                        if self.niri.window_mru_ui.scope() != scope {
+                            self.niri.window_mru_ui.set_scope(scope);
+                        }
+                    }
                     self.niri.window_mru_ui.advance(direction, filter);
                     self.niri.queue_redraw_mru_output();
                 } else if self.niri.config.borrow().recent_windows.on {
