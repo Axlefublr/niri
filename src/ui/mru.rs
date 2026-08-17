@@ -594,8 +594,18 @@ impl WindowMru {
             }
         }
 
-        thumbnails
-            .sort_by(|Thumbnail { timestamp: t1, .. }, Thumbnail { timestamp: t2, .. }| t2.cmp(t1));
+        thumbnails.sort_by(
+            |Thumbnail {
+                 timestamp: t1,
+                 is_focused: f1,
+                 ..
+             },
+             Thumbnail {
+                 timestamp: t2,
+                 is_focused: f2,
+                 ..
+             }| { f2.cmp(f1).then_with(|| t2.cmp(t1)) },
+        );
 
         let current_id = thumbnails.first().map(|t| t.id);
         Self {
