@@ -164,7 +164,11 @@ impl CompositorHandler for State {
                             token.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
                         });
                         if token.is_some() {
-                            ActivateWindow::Yes
+                            if rules.focus_on_xdg_activate == Some(false) {
+                                ActivateWindow::WithoutWorkspace
+                            } else {
+                                ActivateWindow::Yes
+                            }
                         } else {
                             let config = self.niri.config.borrow();
                             if config.debug.strict_new_window_focus_policy {
