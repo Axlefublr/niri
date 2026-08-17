@@ -39,6 +39,7 @@ use crate::render_helpers::surface::{
 };
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, BakedBuffer, RenderCtx, RenderTarget};
+use crate::utils::get_monotonic_time;
 use crate::utils::id::IdCounter;
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -307,7 +308,7 @@ impl Mapped {
             is_maximized: false,
             is_pending_maximized: false,
             uncommitted_maximized: Vec::new(),
-            focus_timestamp: None,
+            focus_timestamp: Some(get_monotonic_time()),
         };
 
         rv.is_maximized = rv.sizing_mode().is_maximized();
