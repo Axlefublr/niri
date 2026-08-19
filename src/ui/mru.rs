@@ -72,7 +72,7 @@ const PANEL_BORDER: i32 = 4;
 const BACKDROP_COLOR: Color32F = Color32F::new(0., 0., 0., 0.8);
 
 /// Font used to render the window titles.
-const FONT: &str = "sans 14px";
+const FONT: &str = "sans 18px";
 
 /// Scopes in the order they are cycled through.
 ///
