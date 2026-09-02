@@ -814,7 +814,10 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn move_to_workspace_down(&mut self, activate: ActivateWindow) {
-        let new_idx = min(self.active_workspace_idx + 1, self.workspaces.len() - 1);
+        let new_idx = min(
+            self.active_workspace_idx + 1,
+            self.workspaces.len().saturating_sub(2),
+        );
         self.move_to_workspace(None, new_idx, activate);
     }
 
@@ -834,7 +837,7 @@ impl<W: LayoutElement> Monitor<W> {
         };
         let source_id = self.workspaces[source_workspace_idx].id();
 
-        let new_idx = min(idx, self.workspaces.len() - 1);
+        let new_idx = min(idx, self.workspaces.len().saturating_sub(2));
         if new_idx == source_workspace_idx {
             return;
         }
@@ -913,14 +916,17 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn move_column_to_workspace_down(&mut self, activate: bool) {
-        let new_idx = min(self.active_workspace_idx + 1, self.workspaces.len() - 1);
+        let new_idx = min(
+            self.active_workspace_idx + 1,
+            self.workspaces.len().saturating_sub(2),
+        );
         self.move_column_to_workspace(new_idx, activate);
     }
 
     pub fn move_column_to_workspace(&mut self, idx: usize, activate: bool) {
         let source_workspace_idx = self.active_workspace_idx;
 
-        let new_idx = min(idx, self.workspaces.len() - 1);
+        let new_idx = min(idx, self.workspaces.len().saturating_sub(2));
         if new_idx == source_workspace_idx {
             return;
         }
@@ -977,7 +983,7 @@ impl<W: LayoutElement> Monitor<W> {
             Some(WorkspaceSwitch::Gesture(gesture)) if gesture.dnd_last_event_time.is_some() => {
                 let current = gesture.current_idx;
                 let new = current.ceil() - 1.;
-                new.clamp(0., (self.workspaces.len() - 1) as f64) as usize
+                new.clamp(0., (self.workspaces.len().saturating_sub(2)) as f64) as usize
             }
             _ => self.active_workspace_idx.saturating_sub(1),
         };
@@ -991,9 +997,12 @@ impl<W: LayoutElement> Monitor<W> {
             Some(WorkspaceSwitch::Gesture(gesture)) if gesture.dnd_last_event_time.is_some() => {
                 let current = gesture.current_idx;
                 let new = current.floor() + 1.;
-                new.clamp(0., (self.workspaces.len() - 1) as f64) as usize
+                new.clamp(0., (self.workspaces.len().saturating_sub(2)) as f64) as usize
             }
-            _ => min(self.active_workspace_idx + 1, self.workspaces.len() - 1),
+            _ => min(
+                self.active_workspace_idx + 1,
+                self.workspaces.len().saturating_sub(2),
+            ),
         };
 
         self.activate_workspace(new_idx);
@@ -1005,11 +1014,11 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn switch_workspace(&mut self, idx: usize) {
-        self.activate_workspace(min(idx, self.workspaces.len() - 1));
+        self.activate_workspace(min(idx, self.workspaces.len().saturating_sub(2)));
     }
 
     pub fn switch_workspace_auto_back_and_forth(&mut self, idx: usize) {
-        let idx = min(idx, self.workspaces.len() - 1);
+        let idx = min(idx, self.workspaces.len().saturating_sub(2));
 
         if idx == self.active_workspace_idx {
             if let Some(prev_idx) = self.previous_workspace_idx() {
@@ -1241,7 +1250,10 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn move_workspace_down(&mut self) {
-        let mut new_idx = min(self.active_workspace_idx + 1, self.workspaces.len() - 1);
+        let mut new_idx = min(
+            self.active_workspace_idx + 1,
+            self.workspaces.len().saturating_sub(2),
+        );
         if new_idx == self.active_workspace_idx {
             return;
         }
@@ -1297,7 +1309,7 @@ impl<W: LayoutElement> Monitor<W> {
             return;
         }
 
-        let mut new_idx = new_idx.clamp(0, self.workspaces.len() - 1);
+        let mut new_idx = new_idx.clamp(0, self.workspaces.len().saturating_sub(2));
         if old_idx == new_idx {
             return;
         }
