@@ -41,6 +41,8 @@ pub struct WindowRule {
     pub custom_scope_exclude: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub docs_scope_include: Option<bool>,
+    #[knuffel(child, unwrap(argument))]
+    pub protect_workspace_on_spawn: Option<bool>,
 
     // Rules applied dynamically.
     #[knuffel(child, unwrap(argument))]

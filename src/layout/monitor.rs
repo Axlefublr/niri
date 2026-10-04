@@ -615,7 +615,10 @@ impl<W: LayoutElement> Monitor<W> {
             workspace_idx += 1;
         }
 
-        if allow_to_activate_workspace && activate.map_smart(|| false) {
+        if allow_to_activate_workspace
+            && activate.map_smart(|| false)
+            && activate != ActivateWindow::WithoutWorkspace
+        {
             self.activate_workspace(workspace_idx);
         }
     }

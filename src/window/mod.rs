@@ -78,6 +78,7 @@ pub struct ResolvedWindowRules {
 
     pub custom_scope_exclude: Option<bool>,
     pub docs_scope_include: Option<bool>,
+    pub protect_workspace_on_spawn: Option<bool>,
 
     /// Extra bound on the minimum window width.
     pub min_width: Option<u16>,
@@ -276,6 +277,10 @@ impl ResolvedWindowRules {
 
                 if let Some(x) = rule.docs_scope_include {
                     resolved.docs_scope_include = Some(x);
+                }
+
+                if let Some(x) = rule.protect_workspace_on_spawn {
+                    resolved.protect_workspace_on_spawn = Some(x);
                 }
 
                 if let Some(x) = rule.min_width {
