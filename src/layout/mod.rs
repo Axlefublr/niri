@@ -516,6 +516,7 @@ pub enum ActivateWindow {
     Smart,
     /// Do not activate.
     No,
+    WithoutWorkspace,
 }
 
 /// Where to put a newly added window.
@@ -628,6 +629,7 @@ impl ActivateWindow {
             ActivateWindow::Yes => true,
             ActivateWindow::Smart => f(),
             ActivateWindow::No => false,
+            ActivateWindow::WithoutWorkspace => true,
         }
     }
 }
