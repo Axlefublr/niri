@@ -214,6 +214,9 @@ impl PointerConstraintsHandler for State {
         }
 
         pointer.set_location(target);
+        // A direct seat position write must record provenance immediately, before any
+        // subsequent operation observes stale ownership.
+        self.niri.record_pointer_provenance();
 
         // Redraw to update the cursor position if it's visible.
         if self.niri.pointer_visibility.is_visible() {

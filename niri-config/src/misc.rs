@@ -14,12 +14,88 @@ pub struct SpawnShAtStartup {
     pub command: String,
 }
 
+#[derive(knuffel::DecodeScalar, Default, Copy, Clone, Debug, PartialEq)]
+pub enum ZoomMovementMode {
+    #[default]
+    CursorFollow,
+    Centered,
+    OnEdge,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, knuffel::DecodeScalar)]
+pub enum ZoomIncrementType {
+    #[default]
+    Linear,
+    Exponential,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, knuffel::DecodeScalar)]
+pub enum ZoomCursorVelocity {
+    /// Content moves at hand speed.
+    #[default]
+    Natural,
+    /// Cursor follows the pointer; content moves faster.
+    HandSpeed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Zoom {
+    pub movement_mode: ZoomMovementMode,
+    pub increment_type: ZoomIncrementType,
+    pub cursor_velocity: ZoomCursorVelocity,
+    pub gesture_sensitivity: f64,
+    pub max_zoom: f64,
+    pub filter_threshold: f64,
+}
+
+impl Default for Zoom {
+    fn default() -> Self {
+        Self {
+            movement_mode: ZoomMovementMode::CursorFollow,
+            increment_type: ZoomIncrementType::Linear,
+            cursor_velocity: ZoomCursorVelocity::default(),
+            gesture_sensitivity: 1.0,
+            max_zoom: 10.0,
+            filter_threshold: 2.0,
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct ZoomPart {
+    #[knuffel(child, unwrap(argument))]
+    pub movement_mode: Option<ZoomMovementMode>,
+    #[knuffel(child, unwrap(argument))]
+    pub increment_type: Option<ZoomIncrementType>,
+    #[knuffel(child, unwrap(argument))]
+    pub cursor_velocity: Option<ZoomCursorVelocity>,
+    #[knuffel(child, unwrap(argument))]
+    pub gesture_sensitivity: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub max_zoom: Option<FloatOrInt<1, { i32::MAX }>>,
+    #[knuffel(child, unwrap(argument))]
+    pub filter_threshold: Option<FloatOrInt<1, { i32::MAX }>>,
+}
+
+impl MergeWith<ZoomPart> for Zoom {
+    fn merge_with(&mut self, part: &ZoomPart) {
+        merge!(
+            (self, part),
+            gesture_sensitivity,
+            filter_threshold,
+            max_zoom
+        );
+        merge_clone!((self, part), movement_mode, increment_type, cursor_velocity,);
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct Cursor {
     pub xcursor_theme: String,
     pub xcursor_size: u8,
     pub hide_when_typing: bool,
     pub hide_after_inactive_ms: Option<u32>,
+    pub scale_with_view: bool,
 }
 
 impl Default for Cursor {
@@ -29,6 +105,7 @@ impl Default for Cursor {
             xcursor_size: 24,
             hide_when_typing: false,
             hide_after_inactive_ms: None,
+            scale_with_view: true,
         }
     }
 }
@@ -43,12 +120,14 @@ pub struct CursorPart {
     pub hide_when_typing: Option<Flag>,
     #[knuffel(child, unwrap(argument))]
     pub hide_after_inactive_ms: Option<u32>,
+    #[knuffel(child)]
+    pub scale_with_view: Option<Flag>,
 }
 
 impl MergeWith<CursorPart> for Cursor {
     fn merge_with(&mut self, part: &CursorPart) {
         merge_clone!((self, part), xcursor_theme, xcursor_size);
-        merge!((self, part), hide_when_typing);
+        merge!((self, part), hide_when_typing, scale_with_view);
         merge_clone_opt!((self, part), hide_after_inactive_ms);
     }
 }

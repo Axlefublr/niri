@@ -1128,9 +1128,9 @@ impl<W: LayoutElement> Monitor<W> {
 
                             // Make sure the hint is at least partially visible.
                             if matches!(hint.position, InsertPosition::NewColumn(_)) {
-                                let zoom = self.overview_zoom();
+                                let overview_zoom = self.overview_zoom();
                                 let geo = insert_hint_ws_geo.unwrap();
-                                let geo = geo.downscale(zoom);
+                                let geo = geo.downscale(overview_zoom);
 
                                 area.loc.x = area.loc.x.max(-geo.loc.x - area.size.w / 2.);
                                 area.loc.x =
@@ -1158,8 +1158,8 @@ impl<W: LayoutElement> Monitor<W> {
                 }
                 InsertWorkspace::NewAt(ws_idx) => {
                     let scale = self.scale.fractional_scale();
-                    let zoom = self.overview_zoom();
-                    let gap = self.workspace_gap(zoom);
+                    let overview_zoom = self.overview_zoom();
+                    let gap = self.workspace_gap(overview_zoom);
 
                     let hint_gap = round_logical_in_physical(scale, gap * 0.1);
                     let hint_height = gap - hint_gap * 2.;
@@ -1369,21 +1369,21 @@ impl<W: LayoutElement> Monitor<W> {
         self.active_workspace_ref().active_window_visual_rectangle()
     }
 
-    fn workspace_size(&self, zoom: f64) -> Size<f64, Logical> {
-        let ws_size = self.view_size.upscale(zoom);
+    fn workspace_size(&self, overview_zoom: f64) -> Size<f64, Logical> {
+        let ws_size = self.view_size.upscale(overview_zoom);
         let scale = self.scale.fractional_scale();
         ws_size.to_physical_precise_ceil(scale).to_logical(scale)
     }
 
-    fn workspace_gap(&self, zoom: f64) -> f64 {
+    fn workspace_gap(&self, overview_zoom: f64) -> f64 {
         let scale = self.scale.fractional_scale();
-        let gap = self.view_size.h * 0.1 * zoom;
+        let gap = self.view_size.h * 0.1 * overview_zoom;
         round_logical_in_physical_max1(scale, gap)
     }
 
-    fn workspace_size_with_gap(&self, zoom: f64) -> Size<f64, Logical> {
-        let gap = self.workspace_gap(zoom);
-        self.workspace_size(zoom) + Size::from((0., gap))
+    fn workspace_size_with_gap(&self, overview_zoom: f64) -> Size<f64, Logical> {
+        let gap = self.workspace_gap(overview_zoom);
+        self.workspace_size(overview_zoom) + Size::from((0., gap))
     }
 
     pub fn overview_zoom(&self) -> f64 {
@@ -1470,8 +1470,8 @@ impl<W: LayoutElement> Monitor<W> {
                 let from_zoom = compute_overview_zoom(&self.options, Some(from));
                 let from_ws_height_with_gap = self.workspace_size_with_gap(from_zoom).h;
 
-                let zoom = self.overview_zoom();
-                let ws_height_with_gap = self.workspace_size_with_gap(zoom).h;
+                let overview_zoom = self.overview_zoom();
+                let ws_height_with_gap = self.workspace_size_with_gap(overview_zoom).h;
 
                 let first_ws_y = -switch_anim.value() * from_ws_height_with_gap
                     + switch_anim.to() * (from_ws_height_with_gap - ws_height_with_gap);
@@ -1489,10 +1489,10 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn workspaces_render_geo(&self) -> impl Iterator<Item = Rectangle<f64, Logical>> {
         let scale = self.scale.fractional_scale();
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
 
-        let ws_size = self.workspace_size(zoom);
-        let gap = self.workspace_gap(zoom);
+        let ws_size = self.workspace_size(overview_zoom);
+        let gap = self.workspace_gap(overview_zoom);
         let ws_height_with_gap = ws_size.h + gap;
 
         let static_offset = (self.view_size.to_point() - ws_size.to_point()).downscale(2.);
@@ -1586,8 +1586,8 @@ impl<W: LayoutElement> Monitor<W> {
         let (ws, geo) = self.workspace_under(pos_within_output)?;
 
         if self.overview_progress.is_some() {
-            let zoom = self.overview_zoom();
-            let pos_within_workspace = (pos_within_output - geo.loc).downscale(zoom);
+            let overview_zoom = self.overview_zoom();
+            let pos_within_workspace = (pos_within_output - geo.loc).downscale(overview_zoom);
             let (win, hit) = ws.window_under(pos_within_workspace)?;
             // During the overview animation, we cannot do input hits because we cannot really
             // represent scaled windows properly.
@@ -1707,14 +1707,14 @@ impl<W: LayoutElement> Monitor<W> {
         // Ceil the height in physical pixels.
         let height = (self.view_size.h * scale).ceil() as i32;
 
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
 
         let insert_hint_render_loc = self
             .insert_hint_render_loc
             .filter(|_| !self.options.layout.insert_hint.off);
 
         let scale_relocate = move |geo: Rectangle<f64, Logical>, elem| {
-            let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);
+            let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), overview_zoom);
             RelocateRenderElement::from_element(
                 elem,
                 // The offset we get from workspaces_with_render_geo() is already
@@ -1778,7 +1778,7 @@ impl<W: LayoutElement> Monitor<W> {
                     }};
                 }
 
-                let xray_pos = XrayPos::new(geo.loc, zoom);
+                let xray_pos = XrayPos::new(geo.loc, overview_zoom);
 
                 match pass {
                     0 => {
@@ -1845,13 +1845,14 @@ impl<W: LayoutElement> Monitor<W> {
         let _span = tracy_client::span!("Monitor::render_workspace_shadows");
 
         let scale = self.scale.fractional_scale();
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
 
         for (ws, geo) in self.workspaces_with_render_geo() {
             ws.render_shadow(renderer, &mut |elem| {
                 let elem = elem.with_alpha(alpha);
                 let elem = MonitorInnerRenderElement::Shadow(elem);
-                let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);
+                let elem =
+                    RescaleRenderElement::from_element(elem, Point::from((0, 0)), overview_zoom);
                 let elem = RelocateRenderElement::from_element(
                     elem,
                     geo.loc.to_physical_precise_round(scale),
@@ -1926,7 +1927,7 @@ impl<W: LayoutElement> Monitor<W> {
             return None;
         }
 
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
         let total_height = if gesture.is_touchpad {
             WORKSPACE_GESTURE_MOVEMENT
         } else {
@@ -1939,14 +1940,14 @@ impl<W: LayoutElement> Monitor<W> {
 
         // Reduce the effect of zoom on the touchpad somewhat.
         let delta_scale = if gesture.is_touchpad {
-            (zoom - 1.) / 2.5 + 1.
+            (overview_zoom - 1.) / 2.5 + 1.
         } else {
-            zoom
+            overview_zoom
         };
 
         let delta_y = delta_y / delta_scale;
         let mut rubber_band = WORKSPACE_GESTURE_RUBBER_BAND;
-        rubber_band.limit /= zoom;
+        rubber_band.limit /= overview_zoom;
 
         gesture.tracker.push(delta_y, timestamp);
 
@@ -1965,7 +1966,7 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn dnd_scroll_gesture_scroll(&mut self, pos: Point<f64, Logical>, speed: f64) -> bool {
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
 
         let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch else {
             return false;
@@ -1981,7 +1982,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // Restrict the scrolling horizontally to the strip of workspaces to avoid unwanted trigger
         // after using the hot corner or during horizontal scroll.
-        let width = self.view_size.w * zoom;
+        let width = self.view_size.w * overview_zoom;
         let x = pos.x - (self.view_size.w - width) / 2.;
 
         // Consider the working area so layer-shell docks and such don't prevent scrolling.
@@ -2058,7 +2059,7 @@ impl<W: LayoutElement> Monitor<W> {
             return false;
         }
 
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
         let total_height = if gesture.dnd_last_event_time.is_some() {
             WORKSPACE_DND_EDGE_SCROLL_MOVEMENT
         } else if gesture.is_touchpad {
@@ -2076,7 +2077,7 @@ impl<W: LayoutElement> Monitor<W> {
         gesture.tracker.push(0., now);
 
         let mut rubber_band = WORKSPACE_GESTURE_RUBBER_BAND;
-        rubber_band.limit /= zoom;
+        rubber_band.limit /= overview_zoom;
 
         let mut velocity = gesture.tracker.velocity() / total_height;
         let current_pos = gesture.tracker.pos() / total_height;

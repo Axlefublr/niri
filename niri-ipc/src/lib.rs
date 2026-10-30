@@ -121,6 +121,13 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Request information about zoom state.
+    ZoomState {
+        /// Output name.
+        ///
+        /// Optional. If not specified, the zoom state of all outputs is printed.
+        output: Option<String>,
+    },
 }
 
 /// Reply from niri to client.
@@ -169,6 +176,8 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// Map from output name to zoom state.
+    ZoomState(HashMap<String, Zoom>),
 }
 
 /// Overview information.
@@ -969,6 +978,21 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: u64,
     },
+    /// Set or adjust the zoom level of an output.
+    SetZoomLevel {
+        /// Zoom level change (absolute like "2.0" or relative like "+0.5", "-0.5").
+        #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
+        level: ZoomLevelChange,
+        /// Optional Output name to set the zoom level for.
+        #[cfg_attr(feature = "clap", arg())]
+        output: Option<String>,
+    },
+    /// Toggle the zoom lock of an output.
+    ToggleZoomLock {
+        /// Optional Output name to toggle the zoom lock for.
+        #[cfg_attr(feature = "clap", arg())]
+        output: Option<String>,
+    },
     /// Reload the config file.
     ///
     /// Can be useful for scripts changing the config file, to avoid waiting the small duration for
@@ -994,6 +1018,16 @@ pub enum SizeChange {
     AdjustFixed(i32),
     /// Add or subtract to the current size as a proportion of the working area.
     AdjustProportion(f64),
+}
+
+/// Zoom level change.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum ZoomLevelChange {
+    /// Set the zoom level directly.
+    Set(f64),
+    /// Add or subtract from the current zoom level.
+    Adjust(f64),
 }
 
 /// Change in floating window position.
@@ -1604,6 +1638,18 @@ pub struct Cast {
     pub pw_node_id: Option<u32>,
 }
 
+/// Zoom State
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct Zoom {
+    /// Current zoom level.
+    pub level: f64,
+    /// Whether zoom is locked.
+    pub is_locked: bool,
+    /// Whether a zoom gesture is active.
+    pub transitioning: bool,
+}
+
 /// Kind of screencast.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -1792,6 +1838,17 @@ pub enum Event {
         /// disabled in hardware, or via `input { touchpad { off; } }`—this is not reflected here.
         on: bool,
     },
+    /// Zoom state changed for an output.
+    ///
+    /// Emitted at commit granularity (not per animation frame), so
+    /// mid-transition values may lag behind the visual state.
+    ZoomChanged {
+        /// Name of the output.
+        output: String,
+        /// Current zoom state.
+        #[serde(flatten)]
+        state: Zoom,
+    },
 }
 
 impl From<Duration> for Timestamp {
@@ -1863,6 +1920,24 @@ impl FromStr for SizeChange {
                     None => Err("value is missing"),
                 }
             }
+        }
+    }
+}
+
+impl FromStr for ZoomLevelChange {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.bytes().next() {
+            Some(b'-' | b'+') => {
+                let value = s.parse().map_err(|_| "error parsing value")?;
+                Ok(Self::Adjust(value))
+            }
+            Some(_) => {
+                let value = s.parse().map_err(|_| "error parsing value")?;
+                Ok(Self::Set(value))
+            }
+            None => Err("value is missing"),
         }
     }
 }
@@ -2224,5 +2299,23 @@ mod tests {
         );
         assert!("-".parse::<PositionChange>().is_err());
         assert!("10% ".parse::<PositionChange>().is_err());
+    }
+
+    #[test]
+    fn parse_zoom_level_change() {
+        assert_eq!(
+            "2.0".parse::<ZoomLevelChange>().unwrap(),
+            ZoomLevelChange::Set(2.0)
+        );
+        assert_eq!(
+            "+0.5".parse::<ZoomLevelChange>().unwrap(),
+            ZoomLevelChange::Adjust(0.5)
+        );
+        assert_eq!(
+            "-0.5".parse::<ZoomLevelChange>().unwrap(),
+            ZoomLevelChange::Adjust(-0.5)
+        );
+
+        assert!("+".parse::<ZoomLevelChange>().is_err());
     }
 }

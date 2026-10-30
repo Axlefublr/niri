@@ -112,6 +112,14 @@ pub enum Msg {
     RequestError,
     /// Print the overview state.
     OverviewState,
+    /// Print the output zoom state.
+    ZoomState {
+        /// Output name.
+        ///
+        /// Optional. If not specified, the zoom state of all outputs is printed.
+        #[arg()]
+        output: Option<String>,
+    },
     /// List screencasts.
     Casts,
     /// Send a raw JSON request to the compositor, reading from stdin.

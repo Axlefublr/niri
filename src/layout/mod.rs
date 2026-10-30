@@ -86,6 +86,7 @@ pub mod shadow;
 pub mod tab_indicator;
 pub mod tile;
 pub mod workspace;
+pub mod zoom;
 
 #[cfg(test)]
 mod tests;
@@ -608,7 +609,7 @@ impl<W: LayoutElement> InteractiveMoveState<W> {
 }
 
 impl<W: LayoutElement> InteractiveMoveData<W> {
-    fn tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
+    fn tile_render_location(&self, overview_zoom: f64) -> Point<f64, Logical> {
         let scale = Scale::from(self.output.current_scale().fractional_scale());
         let window_size = self.tile.window_size();
         let pointer_offset_within_window = Point::from((
@@ -617,7 +618,7 @@ impl<W: LayoutElement> InteractiveMoveData<W> {
         ));
         let pos = self.pointer_pos_within_output
             - (pointer_offset_within_window + self.tile.window_loc() - self.tile.render_offset())
-                .upscale(zoom);
+                .upscale(overview_zoom);
         // Round to physical pixels.
         pos.to_physical_precise_round(scale).to_logical(scale)
     }
@@ -2368,9 +2369,9 @@ impl<W: LayoutElement> Layout<W> {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.output == *output {
                 if self.overview_progress.is_some() {
-                    let zoom = self.overview_zoom();
-                    let tile_pos = move_.tile_render_location(zoom);
-                    let pos_within_tile = (pos_within_output - tile_pos).downscale(zoom);
+                    let overview_zoom = self.overview_zoom();
+                    let tile_pos = move_.tile_render_location(overview_zoom);
+                    let pos_within_tile = (pos_within_output - tile_pos).downscale(overview_zoom);
                     // During the overview animation, we cannot do input hits because we cannot
                     // really represent scaled windows properly.
                     let (win, hit) =
@@ -2439,7 +2440,7 @@ impl<W: LayoutElement> Layout<W> {
 
         use approx::assert_abs_diff_eq;
 
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
 
         let mut move_win_id = None;
         if let Some(state) = &self.interactive_move {
@@ -2472,7 +2473,7 @@ impl<W: LayoutElement> Layout<W> {
                          base options adjusted for output scale"
                     );
 
-                    let tile_pos = move_.tile_render_location(zoom);
+                    let tile_pos = move_.tile_render_location(overview_zoom);
                     let rounded_pos = tile_pos.to_physical_precise_round(scale).to_logical(scale);
 
                     // Tile position must be rounded to physical pixels.
@@ -2663,8 +2664,8 @@ impl<W: LayoutElement> Layout<W> {
             if let Some(mon) = self.monitor_for_output_mut(&output) {
                 let mut scrolled = false;
 
-                let zoom = mon.overview_zoom();
-                scrolled |= mon.dnd_scroll_gesture_scroll(pos_within_output, 1. / zoom);
+                let overview_zoom = mon.overview_zoom();
+                scrolled |= mon.dnd_scroll_gesture_scroll(pos_within_output, 1. / overview_zoom);
 
                 if is_scrolling {
                     if let Some((ws, geo)) = mon.workspace_under(pos_within_output) {
@@ -2673,8 +2674,10 @@ impl<W: LayoutElement> Layout<W> {
                         // As far as the DnD scroll gesture is concerned, the workspace spans across
                         // the whole monitor horizontally.
                         let ws_pos = Point::from((0., geo.loc.y));
-                        scrolled |=
-                            ws.dnd_scroll_gesture_scroll(pos_within_output - ws_pos, 1. / zoom);
+                        scrolled |= ws.dnd_scroll_gesture_scroll(
+                            pos_within_output - ws_pos,
+                            1. / overview_zoom,
+                        );
                     }
                 }
 
@@ -2819,10 +2822,10 @@ impl<W: LayoutElement> Layout<W> {
 
         self.update_render_elements_time = self.clock.now();
 
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if output.is_none_or(|output| move_.output == *output) {
-                let pos_within_output = move_.tile_render_location(zoom);
+                let pos_within_output = move_.tile_render_location(overview_zoom);
 
                 // We're not on any specific workspace so we can't compute a "workspace view" rect.
                 // Let's instead compute a rect relative to the output.
@@ -2833,7 +2836,7 @@ impl<W: LayoutElement> Layout<W> {
                 // workspace.
                 let view_rect =
                     Rectangle::new(pos_within_output.upscale(-1.), output_size(&move_.output))
-                        .downscale(zoom);
+                        .downscale(overview_zoom);
 
                 move_.tile.update_render_elements(true, view_rect);
             }
@@ -2904,14 +2907,14 @@ impl<W: LayoutElement> Layout<W> {
         let _span = tracy_client::span!("Layout::update_insert_hint::update");
 
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
-            let zoom = mon.overview_zoom();
+            let overview_zoom = mon.overview_zoom();
             let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
             match insert_ws {
                 InsertWorkspace::Existing(ws_id) => {
                     let idx = mon.idx_of_ws(ws_id).unwrap();
                     let ws = &mut mon.workspaces[idx];
                     let pos_within_workspace =
-                        (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
+                        (move_.pointer_pos_within_output - geo.loc).downscale(overview_zoom);
                     let position = if move_.is_floating {
                         InsertPosition::Floating
                     } else {
@@ -3725,8 +3728,8 @@ impl<W: LayoutElement> Layout<W> {
         timestamp: Duration,
         is_touchpad: bool,
     ) -> Option<Option<Output>> {
-        let zoom = self.overview_zoom();
-        let delta_x = delta_x / zoom;
+        let overview_zoom = self.overview_zoom();
+        let delta_x = delta_x / overview_zoom;
 
         let monitors = match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => monitors,
@@ -3860,7 +3863,7 @@ impl<W: LayoutElement> Layout<W> {
             return false;
         }
 
-        let zoom = mon.overview_zoom();
+        let overview_zoom = mon.overview_zoom();
 
         let is_floating = ws.is_floating(&window_id);
         let (tile, tile_offset, _visible) = ws
@@ -3869,11 +3872,11 @@ impl<W: LayoutElement> Layout<W> {
             .unwrap();
         let window_offset = tile.window_loc();
 
-        let tile_pos = ws_geo.loc + tile_offset.upscale(zoom);
+        let tile_pos = ws_geo.loc + tile_offset.upscale(overview_zoom);
 
         let pointer_offset_within_window =
-            start_pos_within_output - tile_pos - window_offset.upscale(zoom);
-        let window_size = tile.window_size().upscale(zoom);
+            start_pos_within_output - tile_pos - window_offset.upscale(overview_zoom);
+        let window_size = tile.window_size().upscale(overview_zoom);
         let pointer_ratio_within_window = (
             f64::clamp(pointer_offset_within_window.x / window_size.w, 0., 1.),
             f64::clamp(pointer_offset_within_window.y / window_size.h, 0., 1.),
@@ -3925,8 +3928,8 @@ impl<W: LayoutElement> Layout<W> {
                     return false;
                 }
 
-                let zoom = self.overview_zoom();
-                let delta = delta.downscale(zoom);
+                let overview_zoom = self.overview_zoom();
+                let delta = delta.downscale(overview_zoom);
 
                 pointer_delta += delta;
 
@@ -3990,8 +3993,11 @@ impl<W: LayoutElement> Layout<W> {
                             .find(|(tile, _, _)| tile.window().id() == window)
                             .unwrap();
 
-                        let zoom = mon.overview_zoom();
-                        tile_pos = Some((ws_geo.loc + tile_offset.upscale(zoom), zoom));
+                        let overview_zoom = mon.overview_zoom();
+                        tile_pos = Some((
+                            ws_geo.loc + tile_offset.upscale(overview_zoom),
+                            overview_zoom,
+                        ));
                     }
                 }
 
@@ -4059,10 +4065,10 @@ impl<W: LayoutElement> Layout<W> {
                     workspace_config,
                 };
 
-                if let Some((tile_pos, zoom)) = tile_pos {
-                    let new_tile_pos = data.tile_render_location(zoom);
+                if let Some((tile_pos, overview_zoom)) = tile_pos {
+                    let new_tile_pos = data.tile_render_location(overview_zoom);
                     data.tile
-                        .animate_move_from((tile_pos - new_tile_pos).downscale(zoom));
+                        .animate_move_from((tile_pos - new_tile_pos).downscale(overview_zoom));
                 }
 
                 self.interactive_move = Some(InteractiveMoveState::Moving(data));
@@ -4207,9 +4213,9 @@ impl<W: LayoutElement> Layout<W> {
                 active_monitor_idx,
                 ..
             } => {
-                let (mon, insert_ws, position, offset, zoom) =
+                let (mon, insert_ws, position, offset, overview_zoom) =
                     if let Some(mon) = monitors.iter_mut().find(|mon| mon.output == move_.output) {
-                        let zoom = mon.overview_zoom();
+                        let overview_zoom = mon.overview_zoom();
 
                         let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
                         let (position, offset) = match insert_ws {
@@ -4219,8 +4225,9 @@ impl<W: LayoutElement> Layout<W> {
                                 let position = if move_.is_floating {
                                     InsertPosition::Floating
                                 } else {
-                                    let pos_within_workspace =
-                                        (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
+                                    let pos_within_workspace = (move_.pointer_pos_within_output
+                                        - geo.loc)
+                                        .downscale(overview_zoom);
                                     let ws = &mut mon.workspaces[ws_idx];
                                     ws.scrolling_insert_position(pos_within_workspace)
                                 };
@@ -4238,10 +4245,10 @@ impl<W: LayoutElement> Layout<W> {
                             }
                         };
 
-                        (mon, insert_ws, position, offset, zoom)
+                        (mon, insert_ws, position, offset, overview_zoom)
                     } else {
                         let mon = &mut monitors[*active_monitor_idx];
-                        let zoom = mon.overview_zoom();
+                        let overview_zoom = mon.overview_zoom();
                         // No point in trying to use the pointer position on the wrong output.
                         let ws = &mon.workspaces[0];
                         let ws_geo = mon.workspaces_render_geo().next().unwrap();
@@ -4253,11 +4260,11 @@ impl<W: LayoutElement> Layout<W> {
                         };
 
                         let insert_ws = InsertWorkspace::Existing(ws.id());
-                        (mon, insert_ws, position, Some(ws_geo.loc), zoom)
+                        (mon, insert_ws, position, Some(ws_geo.loc), overview_zoom)
                     };
 
                 let win_id = move_.tile.window().id().clone();
-                let tile_render_loc = move_.tile_render_location(zoom);
+                let tile_render_loc = move_.tile_render_location(overview_zoom);
 
                 let ws_idx = match insert_ws {
                     InsertWorkspace::Existing(ws_id) => mon.idx_of_ws(ws_id).unwrap(),
@@ -4309,7 +4316,7 @@ impl<W: LayoutElement> Layout<W> {
                         match insert_ws {
                             InsertWorkspace::Existing(_) => {
                                 if let Some(offset) = offset {
-                                    let pos = (tile_render_loc - offset).downscale(zoom);
+                                    let pos = (tile_render_loc - offset).downscale(overview_zoom);
                                     let pos =
                                         mon.workspaces[ws_idx].floating_logical_to_size_frac(pos);
                                     tile.floating_pos = Some(pos);
@@ -4358,9 +4365,11 @@ impl<W: LayoutElement> Layout<W> {
                             .map(|(tile, tile_offset)| (tile, tile_offset, geo))
                     })
                     .unwrap();
-                let new_tile_render_loc = ws_geo.loc + tile_offset.upscale(zoom);
+                let new_tile_render_loc = ws_geo.loc + tile_offset.upscale(overview_zoom);
 
-                tile.animate_move_from((tile_render_loc - new_tile_render_loc).downscale(zoom));
+                tile.animate_move_from(
+                    (tile_render_loc - new_tile_render_loc).downscale(overview_zoom),
+                );
 
                 // Interactive move into floating barely animates (it doesn't really move after
                 // being dropped), so setting it as moving between workspaces would just cause it to
@@ -4707,23 +4716,23 @@ impl<W: LayoutElement> Layout<W> {
     ) {
         let _span = tracy_client::span!("Layout::store_unmap_snapshot");
 
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
-                let pos_within_output = move_.tile_render_location(zoom);
+                let pos_within_output = move_.tile_render_location(overview_zoom);
 
                 // Computation matches update_render_elements().
                 let view_rect =
                     Rectangle::new(pos_within_output.upscale(-1.), output_size(&move_.output))
-                        .downscale(zoom);
+                        .downscale(overview_zoom);
                 move_.tile.update_render_elements(false, view_rect);
 
                 move_.tile.store_unmap_snapshot_if_empty(
                     renderer,
                     xray,
                     xray_has_blocked_out_layers,
-                    XrayPos::new(pos_within_output, zoom),
+                    XrayPos::new(pos_within_output, overview_zoom),
                 );
                 return;
             }
@@ -4738,7 +4747,7 @@ impl<W: LayoutElement> Layout<W> {
                                 renderer,
                                 xray,
                                 xray_has_blocked_out_layers,
-                                XrayPos::new(geo.loc, zoom),
+                                XrayPos::new(geo.loc, overview_zoom),
                                 window,
                             );
                             return;
@@ -4801,14 +4810,14 @@ impl<W: LayoutElement> Layout<W> {
     ) {
         let _span = tracy_client::span!("Layout::start_close_animation_for_window");
 
-        let zoom = self.overview_zoom();
+        let overview_zoom = self.overview_zoom();
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
                 let Some(snapshot) = move_.tile.take_unmap_snapshot() else {
                     return;
                 };
-                let tile_pos = move_.tile_render_location(zoom);
+                let tile_pos = move_.tile_render_location(overview_zoom);
                 let tile_size = move_.tile.tile_size();
 
                 let output = move_.output.clone();
@@ -4869,9 +4878,9 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         let scale = Scale::from(move_.output.current_scale().fractional_scale());
-        let zoom = self.overview_zoom();
-        let pos_in_backdrop = move_.tile_render_location(zoom);
-        let xray_pos = XrayPos::new(pos_in_backdrop, zoom);
+        let overview_zoom = self.overview_zoom();
+        let pos_in_backdrop = move_.tile_render_location(overview_zoom);
+        let xray_pos = XrayPos::new(pos_in_backdrop, overview_zoom);
 
         move_
             .tile
@@ -4879,7 +4888,7 @@ impl<W: LayoutElement> Layout<W> {
                 push(RescaleRenderElement::from_element(
                     elem,
                     pos_in_backdrop.to_physical_precise_round(scale),
-                    zoom,
+                    overview_zoom,
                 ));
             });
     }
@@ -5047,10 +5056,10 @@ impl<W: LayoutElement> Default for MonitorSet<W> {
 
 fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>) -> f64 {
     // Clamp to some sane values.
-    let zoom = options.overview.zoom.clamp(0.0001, 0.75);
+    let overview_zoom = options.overview.zoom.clamp(0.0001, 0.75);
 
     if let Some(p) = overview_progress {
-        (1. - p * (1. - zoom)).max(0.0001)
+        (1. - p * (1. - overview_zoom)).max(0.0001)
     } else {
         1.
     }

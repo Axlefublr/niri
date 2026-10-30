@@ -77,6 +77,12 @@ impl TouchOverviewGrab {
             return true;
         };
 
+        let delta = self.new_location - self.last_location;
+        let content_frame_delta = data
+            .niri
+            .content_delta(self.last_location, self.new_location);
+        self.last_location = self.new_location;
+
         let layout = &mut data.niri.layout;
 
         // Check if we should become interactive move.
@@ -140,9 +146,6 @@ impl TouchOverviewGrab {
             return true;
         }
 
-        let delta = self.new_location - self.last_location;
-        self.last_location = self.new_location;
-
         let ongoing = match self.gesture {
             GestureState::Recognizing => unreachable!(),
             GestureState::ViewOffset => layout
@@ -158,7 +161,7 @@ impl TouchOverviewGrab {
                     let output = output.clone();
                     data.niri.layout.interactive_move_update(
                         window,
-                        delta,
+                        content_frame_delta,
                         output,
                         pos_within_output,
                     )

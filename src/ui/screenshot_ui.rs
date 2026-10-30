@@ -93,9 +93,16 @@ pub struct OutputScreenshot {
 }
 
 niri_render_elements! {
+    ScreenshotChrome => {
+        Texture = PrimaryGpuTextureRenderElement,
+    }
+}
+
+niri_render_elements! {
     ScreenshotUiRenderElement => {
         Screenshot = PrimaryGpuTextureRenderElement,
         SolidColor = SolidColorRenderElement,
+        Chrome = ScreenshotChrome,
     }
 }
 
@@ -637,13 +644,15 @@ impl ScreenshotUi {
                 .to_f64()
                 .to_logical(scale);
 
-            let elem = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                buffer.clone(),
-                location,
-                alpha * progress,
-                None,
-                None,
-                Kind::Unspecified,
+            let elem = ScreenshotChrome::Texture(PrimaryGpuTextureRenderElement(
+                TextureRenderElement::from_texture_buffer(
+                    buffer.clone(),
+                    location,
+                    alpha * progress,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ),
             ));
             push(elem.into());
         }

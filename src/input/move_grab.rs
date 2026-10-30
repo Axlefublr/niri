@@ -35,6 +35,7 @@ pub struct MoveGrab {
     new_location: Point<f64, Logical>,
     event_timestamp: Option<Duration>,
     relative_delta: Option<Point<f64, Logical>>,
+    content_moved: Point<f64, Logical>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,7 @@ impl MoveGrab {
             new_location: location,
             event_timestamp: None,
             relative_delta: None,
+            content_moved: Point::from((0., 0.)),
         })
     }
 
@@ -175,10 +177,16 @@ impl MoveGrab {
             return true;
         };
 
-        let mut delta = self.new_location - self.last_location;
+        let delta = self.new_location - self.last_location;
         let mut relative_delta = self.relative_delta.take().unwrap_or(delta);
+        let content_frame_delta = data
+            .niri
+            .content_delta(self.last_location, self.new_location);
         self.last_location = self.new_location;
+        self.content_moved += content_frame_delta;
 
+        // Move delta; replaced with the recognizing total when the gesture starts.
+        let mut move_delta = content_frame_delta;
         // Try to recognize the gesture.
         if self.gesture == GestureState::Recognizing {
             // Check if the window has closed.
@@ -187,7 +195,7 @@ impl MoveGrab {
             }
 
             // Check if the gesture moved far enough to decide.
-            let c = self.new_location - self.start_data.location();
+            let c = self.content_moved;
             if c.x * c.x + c.y * c.y >= 8. * 8. {
                 let is_floating = data
                     .niri
@@ -212,9 +220,11 @@ impl MoveGrab {
                     return false;
                 }
 
-                // Apply the whole delta that accumulated during recognizing.
-                delta = c;
-                relative_delta = c;
+                // Apply the whole content delta that accumulated during recognition.
+                // View offset uses the relative delta and keeps the screen total, while move uses
+                // the absolute delta.
+                move_delta = c;
+                relative_delta = self.new_location - self.start_data.location();
             }
         }
 
@@ -231,7 +241,7 @@ impl MoveGrab {
                 // to the cursor even when it's clamped to monitor bounds.
                 let ongoing = data.niri.layout.interactive_move_update(
                     &self.window,
-                    delta,
+                    move_delta,
                     output,
                     pos_within_output,
                 );
@@ -279,7 +289,7 @@ impl MoveGrab {
             // Apply the delta accumulated during recognizing.
             let ongoing = data.niri.layout.interactive_move_update(
                 &self.window,
-                self.last_location - self.start_data.location(),
+                self.content_moved,
                 output,
                 pos_within_output,
             );

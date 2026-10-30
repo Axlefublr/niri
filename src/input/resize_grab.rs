@@ -23,6 +23,10 @@ pub struct ResizeGrab {
 
     // Accumulated and applied in frame().
     new_location: Point<f64, Logical>,
+    /// Content baseline for per-frame endpoint differencing.
+    last_location: Point<f64, Logical>,
+    /// Content-space movement since grab start, from content endpoints.
+    content_moved: Point<f64, Logical>,
 }
 
 impl ResizeGrab {
@@ -33,6 +37,8 @@ impl ResizeGrab {
             start_data,
             window,
             new_location: location,
+            last_location: location,
+            content_moved: Point::from((0.0, 0.0)),
         }
     }
 
@@ -52,10 +58,16 @@ impl ResizeGrab {
             return false;
         }
 
-        let delta = self.new_location - self.start_data.location();
+        // Content movement this frame; cross-output frames contribute zero and rebase.
+        let content_frame_delta = data
+            .niri
+            .content_delta(self.last_location, self.new_location);
+        self.last_location = self.new_location;
+        self.content_moved += content_frame_delta;
+
         data.niri
             .layout
-            .interactive_resize_update(&self.window, delta)
+            .interactive_resize_update(&self.window, self.content_moved)
     }
 }
 

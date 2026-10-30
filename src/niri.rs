@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
 use niri_config::output::MaxBpc;
+use niri_config::utils::MergeWith;
 use niri_config::window_rule::VrrRule;
 use niri_config::{
     Bind, Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
@@ -143,6 +144,7 @@ use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
+use crate::input::zoom_gesture::ZoomInputState;
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_horizontal_wheel_binds,
     mods_with_mouse_binds, mods_with_tablet_stylus_binds, mods_with_vertical_wheel_binds,
@@ -153,6 +155,7 @@ use crate::layer::mapped::LayerSurfaceRenderElement;
 use crate::layer::MappedLayer;
 use crate::layout::tile::TileRenderElement;
 use crate::layout::workspace::{Workspace, WorkspaceId};
+use crate::layout::zoom::{OutputZoomState, ZoomAction};
 use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
 };
@@ -170,6 +173,7 @@ use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::TextureBuffer;
+use crate::render_helpers::view::{view_filter, ViewElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
@@ -186,6 +190,7 @@ use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRende
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
+use crate::utils::view::OutputViewport;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
@@ -195,6 +200,8 @@ use crate::utils::{
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
+
+mod zoom_pointer;
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
@@ -209,6 +216,56 @@ pub struct SavedKeyboardState {
     pub layout: Option<KeyboardLayout>,
     pub caps_lock: Option<bool>,
     pub num_lock: Option<bool>,
+}
+
+/// Provenance of the last actual seat position write: its owning output and placement,
+/// retained across output geometry changes. Every actual seat position write must record
+/// this; a geometry-only refresh preserves it. This is compositor provenance, not a cached
+/// zoom transform or a tablet cursor anchor.
+#[derive(Debug, Clone)]
+pub struct PointerProvenance {
+    output: Output,
+    geometry: Rectangle<f64, Logical>,
+}
+
+struct ZoomCursorMovement {
+    output: Output,
+    location: Point<f64, Logical>,
+    geometry: Rectangle<f64, Logical>,
+}
+
+pub struct ZoomPointerHandoff {
+    output: Output,
+    pub target: Point<f64, Logical>,
+    geometry: Rectangle<f64, Logical>,
+    before: Option<Point<f64, Logical>>,
+}
+
+pub enum ZoomPointerPreparation {
+    Blocked,
+    Track,
+    Handoff(ZoomPointerHandoff),
+}
+
+pub struct DeferredZoomPointerInput {
+    before: Option<Point<f64, Logical>>,
+    recapture_before: bool,
+    physical_pointer: bool,
+    prepared_track: Option<bool>,
+    resume: Box<dyn FnOnce(&mut State, ZoomInputResume)>,
+}
+
+pub struct ZoomInputResume {
+    pub before: Option<Point<f64, Logical>>,
+    pub track_zoom: bool,
+}
+
+/// State of an in-flight batch of deferred zoom pointer inputs.
+#[derive(Default)]
+pub(crate) struct DeferredZoomPointerBatch {
+    pub(crate) inputs: VecDeque<DeferredZoomPointerInput>,
+    /// Whether an input already advanced animations for this batch.
+    advance_done: bool,
 }
 
 pub struct Niri {
@@ -424,7 +481,18 @@ pub struct Niri {
     pub pointer_inside_hot_corner: bool,
     pub pointer_constraint_position_hint: Option<Point<f64, Logical>>,
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
+    pub pointer_provenance: Option<PointerProvenance>,
+    pub(crate) zoom_cursor_sync_idle_pending: bool,
+    /// In-flight batch of deferred zoom pointer inputs; `None` when no batch is active.
+    ///
+    /// The batch stays active even while its queue temporarily empties during callbacks.
+    pub(crate) deferred_input_batch: Option<DeferredZoomPointerBatch>,
+    zoom_sync_render_deferred: bool,
+    /// Physical pinch routing, retained independently of output zoom-motion interruption.
+    pub zoom_input: ZoomInputState,
+
     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
+
     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
     pub vertical_wheel_tracker: ScrollTracker,
     pub horizontal_wheel_tracker: ScrollTracker,
@@ -546,6 +614,8 @@ pub struct OutputState {
     screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// Zoom state used to track screen magnification.
+    pub zoom: OutputZoomState,
 }
 
 #[derive(Debug, Default)]
@@ -824,7 +894,13 @@ impl State {
         // in order to clear completed animations and render elements. Even if we're not rendering,
         // it's good to advance every now and then so the workspace clean-up and animations don't
         // build up (the 1 second frame callback timer will call this line).
-        self.niri.advance_animations();
+        if !self.niri.zoom_sync_render_deferred {
+            self.niri.advance_animations();
+        }
+        if self.niri.zoom_cursor_sync_idle_pending {
+            self.niri.zoom_sync_render_deferred = true;
+            return;
+        }
 
         self.niri.redraw_queued_outputs(&mut self.backend);
 
@@ -840,6 +916,7 @@ impl State {
         self.niri.clock.clear();
         self.niri.pointer_inactivity_timer_got_reset = false;
         self.niri.notified_activity_this_iteration = false;
+        self.niri.zoom_sync_render_deferred = false;
     }
 
     // We monitor both libinput and logind: libinput is always there (including without DBus), but
@@ -893,6 +970,7 @@ impl State {
 
         self.niri.refresh_window_rules();
         self.refresh_ipc_outputs();
+        self.ipc_refresh_zoom();
         self.ipc_refresh_layout();
         self.ipc_refresh_keyboard_layout_index();
         self.ipc_refresh_touchpad();
@@ -1028,6 +1106,8 @@ impl State {
             },
         );
         pointer.frame(self);
+
+        self.niri.record_pointer_provenance();
 
         self.niri.maybe_activate_pointer_constraint();
 
@@ -1259,6 +1339,10 @@ impl State {
             },
         );
 
+        // This refresh normally writes the same position. Preserve its prior owner/origin
+        // rather than treating newly changed geometry as real pointer movement.
+        self.niri.pointer_provenance_snapshot();
+
         self.niri.maybe_activate_pointer_constraint();
 
         true
@@ -1266,7 +1350,13 @@ impl State {
 
     pub fn move_cursor_to_output(&mut self, output: &Output) {
         let geo = self.niri.global_space.output_geometry(output).unwrap();
-        self.move_cursor(center(geo).to_f64());
+        // The output geometry is screen space; the stored cursor and movement locations are
+        // content.
+        let content_center = self
+            .niri
+            .screen_to_content_global(output, center(geo).to_f64());
+        self.move_cursor(content_center);
+        self.niri.zoom_track_cursor(output, content_center);
     }
 
     pub fn refresh_popup_grab(&mut self) {
@@ -1754,6 +1844,10 @@ impl State {
             self.niri.cursor_texture_cache.clear();
         }
 
+        if config.zoom != old_config.zoom {
+            output_config_changed = true;
+        }
+
         // We need &mut self to reload the xkb config, so just store it here.
         if config.input.keyboard.xkb != old_config.input.keyboard.xkb {
             reload_xkb = true;
@@ -2050,6 +2144,22 @@ impl State {
                 }
                 break;
             }
+
+            let mut zoom = full_config.zoom;
+            if let Some(part) = config.and_then(|c| c.zoom.clone()) {
+                zoom.merge_with(&part);
+            }
+
+            if let Some(state) = self.niri.output_state.get_mut(output) {
+                let changed = state.update_zoom(ZoomAction::Configure(
+                    zoom,
+                    full_config.animations.zoom_level_change,
+                    full_config.animations.zoom_focal_pan,
+                ));
+                if changed {
+                    recolored_outputs.push(output.clone());
+                }
+            }
         }
 
         for output in resized_outputs {
@@ -2230,6 +2340,7 @@ impl State {
             return;
         };
 
+        self.niri.sync_zoom_cursor();
         self.niri.update_render_elements(None);
 
         let Some(screenshots) = self
@@ -2877,7 +2988,12 @@ impl Niri {
             pointer_inside_hot_corner: false,
             pointer_constraint_position_hint: None,
             tablet_cursor_location: None,
+            pointer_provenance: None,
+            zoom_cursor_sync_idle_pending: false,
+            deferred_input_batch: None,
+            zoom_sync_render_deferred: false,
             gesture_swipe_3f_cumulative: None,
+            zoom_input: ZoomInputState::default(),
             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
             vertical_wheel_tracker: ScrollTracker::new(120),
             horizontal_wheel_tracker: ScrollTracker::new(120),
@@ -3145,6 +3261,12 @@ impl Niri {
                 layout.background_color = c.and_then(|c| c.background_color);
             }
         }
+
+        let mut zoom_config = config.zoom;
+        if let Some(part) = config.outputs.find(name).and_then(|o| o.zoom.clone()) {
+            zoom_config.merge_with(&part);
+        }
+
         drop(config);
 
         // Set scale and transform before adding to the layout since that will read the output size.
@@ -3181,6 +3303,7 @@ impl Niri {
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            zoom: OutputZoomState::new(&output, self.clock.clone(), zoom_config),
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -3204,6 +3327,13 @@ impl Niri {
     }
 
     pub fn remove_output(&mut self, output: &Output) {
+        if self
+            .pointer_provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.output == *output)
+        {
+            self.pointer_provenance = None;
+        }
         for layer in layer_map_for_output(output).layers() {
             layer.layer_surface().send_close();
         }
@@ -3302,6 +3432,7 @@ impl Niri {
             state.backdrop_buffer.resize(output_size);
 
             state.lock_color_buffer.resize(output_size);
+            state.update_zoom(ZoomAction::Resize(output_size));
             if let Some(lock_surface) = &state.lock_surface {
                 configure_lock_surface(lock_surface, output);
             }
@@ -3347,6 +3478,429 @@ impl Niri {
         self.queue_redraw_all();
     }
 
+    /// Track the zoom cursor for `output`.
+    pub fn zoom_track_cursor(&mut self, output: &Output, pos: Point<f64, Logical>) {
+        let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
+        let pos = pos - output_geo.loc;
+        if let Some(state) = self.output_state.get_mut(output) {
+            state.update_zoom(ZoomAction::PointerMove(pos));
+        }
+    }
+
+    /// Plan the mode handoff after State has synchronously applied any pending reprojection.
+    pub fn prepare_zoom_pointer_input(
+        &mut self,
+        before: Option<Point<f64, Logical>>,
+    ) -> ZoomPointerPreparation {
+        if self.zoom_pointer_input_is_blocked() {
+            return ZoomPointerPreparation::Blocked;
+        }
+        let Some(actual) = self
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location())
+        else {
+            return ZoomPointerPreparation::Blocked;
+        };
+        let Some((output, local)) = self.output_under(actual) else {
+            return ZoomPointerPreparation::Track;
+        };
+        let output = output.clone();
+        let Some(state) = self.output_state.get(&output) else {
+            return ZoomPointerPreparation::Track;
+        };
+        let Some(target) = state.zoom().pointer_handoff_target(local) else {
+            return ZoomPointerPreparation::Track;
+        };
+        let Some(geometry) = self.global_space.output_geometry(&output) else {
+            return ZoomPointerPreparation::Blocked;
+        };
+        let geometry = geometry.to_f64();
+        let extent = geometry.loc + geometry.size;
+        if geometry.size.w <= 0. || geometry.size.h <= 0. {
+            return ZoomPointerPreparation::Blocked;
+        }
+        let mut target = target + geometry.loc;
+        // Clamp only illegal GLOBAL components. Local next_down + origin can round to extent.
+        target.x = target.x.clamp(geometry.loc.x, extent.x.next_down());
+        target.y = target.y.clamp(geometry.loc.y, extent.y.next_down());
+        if !target.x.is_finite() || !target.y.is_finite() {
+            return ZoomPointerPreparation::Blocked;
+        }
+
+        ZoomPointerPreparation::Handoff(ZoomPointerHandoff {
+            output,
+            target,
+            geometry,
+            before,
+        })
+    }
+
+    pub fn finish_zoom_pointer_handoff(
+        &mut self,
+        handoff: ZoomPointerHandoff,
+        actual: Point<f64, Logical>,
+    ) -> bool {
+        if actual != handoff.target
+            || self.output_under(actual).map(|(owner, _)| owner) != Some(&handoff.output)
+        {
+            // A rejected dispatch is not a handoff. Retry from actual geometry on later input.
+            return false;
+        }
+        let config = self.config.borrow().animations.zoom_level_change;
+        self.output_state
+            .get_mut(&handoff.output)
+            .unwrap()
+            .update_zoom(ZoomAction::PointerHandoff(
+                actual - handoff.geometry.loc,
+                config,
+            ));
+        self.sync_zoom_cursor();
+        // Establish the synthetic hot-corner baseline without activating the overview UI.
+        if handoff.before != Some(actual) {
+            self.pointer_inside_hot_corner =
+                self.is_inside_hot_corner(&handoff.output, actual - handoff.geometry.loc);
+        }
+        !self.zoom_pointer_input_is_blocked()
+    }
+
+    /// A gated/rejected physical dispatch may be changed by a grab. Record only the actual seat.
+    pub fn record_zoom_pointer_input(&mut self) {
+        let Some(actual) = self.seat.get_pointer().map(|p| p.current_location()) else {
+            return;
+        };
+        if let Some((output, local)) = self.output_under(actual) {
+            let output = output.clone();
+            if let Some(state) = self.output_state.get_mut(&output) {
+                state.zoom.record_cursor(local);
+            }
+        }
+    }
+
+    pub fn record_pointer_provenance(&mut self) {
+        self.pointer_provenance = self.seat.get_pointer().and_then(|pointer| {
+            let position = pointer.current_location();
+            let (output, _) = self.output_under(position)?;
+            Some(PointerProvenance {
+                output: output.clone(),
+                geometry: self.global_space.output_geometry(output)?.to_f64(),
+            })
+        });
+    }
+
+    pub fn sync_zoom_cursor(&mut self) {
+        if self.seat.get_pointer().is_some() && self.has_pending_zoom_pointer_change() {
+            self.schedule_zoom_cursor_idle();
+        }
+    }
+
+    fn has_pending_zoom_pointer_change(&self) -> bool {
+        self.output_state
+            .values()
+            .any(|state| state.zoom.pending_zoom_pointer.is_some())
+    }
+
+    fn schedule_zoom_cursor_idle(&mut self) {
+        if self.zoom_cursor_sync_idle_pending {
+            return;
+        }
+        self.zoom_cursor_sync_idle_pending = true;
+        self.event_loop.insert_idle(|state| {
+            state.niri.zoom_cursor_sync_idle_pending = false;
+
+            if let Some(movement) = state.niri.plan_zoom_cursor_sync() {
+                let current = state
+                    .niri
+                    .seat
+                    .get_pointer()
+                    .map(|pointer| pointer.current_location());
+                if current != Some(movement.location) {
+                    state.move_cursor(movement.location);
+                }
+                if let Some(actual) = state
+                    .niri
+                    .seat
+                    .get_pointer()
+                    .map(|pointer| pointer.current_location())
+                {
+                    state.niri.finish_zoom_cursor_sync(movement, actual);
+                }
+            }
+            state.niri.sync_zoom_cursor();
+            if state.niri.zoom_cursor_sync_idle_pending {
+                return;
+            }
+
+            loop {
+                let Some(mut deferred) = state
+                    .niri
+                    .deferred_input_batch
+                    .as_mut()
+                    .and_then(|batch| batch.inputs.pop_front())
+                else {
+                    break;
+                };
+
+                if deferred.recapture_before {
+                    deferred.before = state
+                        .niri
+                        .seat
+                        .get_pointer()
+                        .map(|pointer| pointer.current_location());
+                    deferred.recapture_before = false;
+                }
+
+                let track_zoom = if let Some(track_zoom) = deferred.prepared_track {
+                    track_zoom
+                } else if !deferred.physical_pointer {
+                    true
+                } else {
+                    match state.niri.prepare_zoom_pointer_input(deferred.before) {
+                        ZoomPointerPreparation::Blocked => false,
+                        ZoomPointerPreparation::Track => true,
+                        ZoomPointerPreparation::Handoff(handoff) => {
+                            let current = state
+                                .niri
+                                .seat
+                                .get_pointer()
+                                .map(|pointer| pointer.current_location());
+                            if current != Some(handoff.target) {
+                                state.move_cursor(handoff.target);
+                            }
+                            let Some(actual) = state
+                                .niri
+                                .seat
+                                .get_pointer()
+                                .map(|pointer| pointer.current_location())
+                            else {
+                                deferred.prepared_track = Some(false);
+                                state
+                                    .niri
+                                    .deferred_input_batch
+                                    .as_mut()
+                                    .expect(
+                                        "requeueing a deferred zoom pointer input without an active \
+                                         batch",
+                                    )
+                                    .inputs
+                                    .push_front(deferred);
+                                break;
+                            };
+                            state.niri.finish_zoom_pointer_handoff(handoff, actual)
+                        }
+                    }
+                };
+
+                if state.niri.has_pending_zoom_pointer_change() {
+                    deferred.prepared_track = Some(track_zoom);
+                    state
+                        .niri
+                        .deferred_input_batch
+                        .as_mut()
+                        .expect(
+                            "requeueing a deferred zoom pointer input without an active batch",
+                        )
+                        .inputs
+                        .push_front(deferred);
+                    state.niri.sync_zoom_cursor();
+                    break;
+                }
+
+                let resume = ZoomInputResume {
+                    before: deferred.before,
+                    track_zoom,
+                };
+                (deferred.resume)(state, resume);
+
+                if state.niri.zoom_cursor_sync_idle_pending {
+                    break;
+                }
+            }
+
+            if !state.niri.zoom_cursor_sync_idle_pending {
+                if state
+                    .niri
+                    .deferred_input_batch
+                    .as_ref()
+                    .is_some_and(|batch| !batch.inputs.is_empty())
+                {
+                    state.niri.schedule_zoom_cursor_idle();
+                } else {
+                    state.niri.deferred_input_batch = None;
+                    if state.niri.zoom_sync_render_deferred {
+                        state.niri.queue_redraw_all();
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn defer_zoom_pointer_input(
+        &mut self,
+        before: Option<Point<f64, Logical>>,
+        recapture_before: bool,
+        physical_pointer: bool,
+        prepared_track: Option<bool>,
+        advance_done: bool,
+        resume: Box<dyn FnOnce(&mut State, ZoomInputResume)>,
+        front: bool,
+    ) {
+        let batch = self
+            .deferred_input_batch
+            .get_or_insert_with(Default::default);
+        batch.advance_done |= advance_done;
+
+        let input = DeferredZoomPointerInput {
+            before,
+            recapture_before,
+            physical_pointer,
+            prepared_track,
+            resume,
+        };
+        if front {
+            batch.inputs.push_front(input);
+        } else {
+            batch.inputs.push_back(input);
+        }
+        self.schedule_zoom_cursor_idle();
+    }
+
+    fn plan_zoom_cursor_sync(&mut self) -> Option<ZoomCursorMovement> {
+        let pos = self
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location())?;
+        let blocked = self.zoom_pointer_is_manipulated();
+        // Drain every effect and gather immutable policy inputs before any seat/output write.
+        let outputs: Vec<_> = self
+            .output_state
+            .iter_mut()
+            .map(|(output, state)| zoom_pointer::OutputSnapshot {
+                output: output.clone(),
+                geometry: self
+                    .global_space
+                    .output_geometry(output)
+                    .map(|geometry| geometry.to_f64()),
+                view: state.zoom.view(),
+                pending: state.zoom.pending_zoom_pointer.take(),
+            })
+            .collect();
+        let current = self.output_under(pos).and_then(|(output, _)| {
+            Some(PointerProvenance {
+                output: output.clone(),
+                geometry: self.global_space.output_geometry(output)?.to_f64(),
+            })
+        });
+        let (provenance, selected) = zoom_pointer::plan_reprojection(
+            pos,
+            self.pointer_provenance.as_ref(),
+            current,
+            &outputs,
+        );
+        self.pointer_provenance = provenance;
+        let selected = selected?;
+        if blocked {
+            self.output_state
+                .get_mut(&selected.output)
+                .unwrap()
+                .update_zoom(ZoomAction::Interrupt);
+            return None;
+        }
+        let movement = selected.movement?;
+        Some(ZoomCursorMovement {
+            output: selected.output,
+            location: movement.location,
+            geometry: movement.geometry,
+        })
+    }
+
+    fn finish_zoom_cursor_sync(
+        &mut self,
+        movement: ZoomCursorMovement,
+        actual: Point<f64, Logical>,
+    ) {
+        if actual != movement.location {
+            return;
+        }
+        // Use the actual seat write's rounded local coordinates and explicit selected owner.
+        if let Some(state) = self.output_state.get_mut(&movement.output) {
+            state.zoom.record_cursor(actual - movement.geometry.loc);
+            self.pointer_provenance = Some(PointerProvenance {
+                output: movement.output,
+                geometry: movement.geometry,
+            });
+        }
+    }
+
+    fn pointer_provenance_snapshot(&mut self) -> Option<PointerProvenance> {
+        // Placement reconciliation happens during zoom cursor sync after collecting effects,
+        // so a pending original-owner effect can still use the origin preceding a relocation.
+        self.seat.get_pointer()?;
+        if !self
+            .pointer_provenance
+            .as_ref()
+            .is_some_and(|provenance| self.output_exists(&provenance.output))
+        {
+            // Seed initially or after owner removal. An existing owner is never re-anchored by
+            // new geometry here.
+            self.record_pointer_provenance();
+        }
+        self.pointer_provenance.clone()
+    }
+
+    /// No synthetic zoom motion may run through a drag or active locked/confined pointer.
+    pub fn zoom_pointer_is_manipulated(&self) -> bool {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return false;
+        };
+        if pointer.is_grabbed() {
+            return true;
+        }
+        let mut active = false;
+        if let Some(surface) = pointer.current_focus() {
+            with_pointer_constraint(&surface, &pointer, |constraint| {
+                active = constraint.is_some_and(|constraint| constraint.is_active());
+            });
+        }
+        active
+    }
+
+    fn zoom_pointer_input_is_blocked(&self) -> bool {
+        self.zoom_pointer_is_manipulated()
+            || self.is_locked()
+            || self.screenshot_ui.is_open()
+            || self.layout.is_overview_open()
+            || self.window_mru_ui.is_open()
+            || self.seat.get_touch().is_some_and(|touch| {
+                touch
+                    .with_grab(|_, grab| {
+                        !grab
+                            .as_any()
+                            .is::<smithay::input::touch::TouchDownGrab<State>>()
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    pub fn clamp_pointer_to_viewport(
+        &self,
+        output: &Output,
+        pointer_pos: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        if let Some(state) = self.output_state.get(output) {
+            if !state.zoom.locked() {
+                return pointer_pos;
+            }
+            let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
+            let output_origin = output_geo.loc;
+            let view = self.output_view(output);
+            let viewport = view.visible_viewport(output_geo.size);
+            (pointer_pos - output_origin).constrain(viewport) + output_origin
+        } else {
+            pointer_pos
+        }
+    }
+
     pub fn output_under(&self, pos: Point<f64, Logical>) -> Option<(&Output, Point<f64, Logical>)> {
         let output = self.global_space.output_under(pos).next()?;
         let pos_within_output = pos
@@ -3377,6 +3931,9 @@ impl Niri {
         // motion clamping.
         let geom = self.global_space.output_geometry(output).unwrap();
         let size = geom.size.to_f64();
+
+        // NOTE: We test for the hot-corners only in output-local content space. So we don't apply
+        // any transform to `pos`.
 
         let contains = move |corner: Point<f64, Logical>| {
             Rectangle::new(corner, Size::new(1., 1.)).contains(pos)
@@ -3578,6 +4135,26 @@ impl Niri {
     pub fn window_under_cursor(&self) -> Option<&Mapped> {
         let pos = self.seat.get_pointer().unwrap().current_location();
         self.window_under(pos)
+    }
+
+    /// Difference of content-space endpoints, zero across outputs.
+    ///
+    /// Inputs are already content (the content points under the drawn cursor),
+    /// so this is a pass-through difference with no viewport inverse.
+    pub fn content_delta(
+        &self,
+        prev: Point<f64, Logical>,
+        now: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let (Some((prev_output, _)), Some((now_output, _))) =
+            (self.output_under(prev), self.output_under(now))
+        else {
+            return Point::from((0., 0.));
+        };
+        if prev_output != now_output {
+            return Point::from((0., 0.));
+        }
+        now - prev
     }
 
     /// Returns contents under the given point.
@@ -3998,10 +4575,14 @@ impl Niri {
         &self,
         renderer: &mut R,
         output: &Output,
+        view: OutputViewport,
         push: &mut dyn FnMut(PointerRenderElements<R>),
     ) {
         let _span = tracy_client::span!("Niri::render_pointer");
-        let output_scale = output.current_scale();
+
+        let cursor_scale = output.current_scale().integer_scale();
+        let output_scale = Scale::from(output.current_scale().fractional_scale());
+
         let output_pos = self.global_space.output_geometry(output).unwrap().loc;
 
         // Check whether we need to draw the tablet cursor or the regular cursor.
@@ -4011,25 +4592,43 @@ impl Niri {
         let pointer_pos = pointer_pos - output_pos.to_f64();
 
         // Get the render cursor to draw.
-        let cursor_scale = output_scale.integer_scale();
         let render_cursor = self.cursor_manager.get_render_cursor(cursor_scale);
 
-        let output_scale = Scale::from(output.current_scale().fractional_scale());
+        let tip = view.content_to_screen(pointer_pos);
+        let anchor = pointer_pos.to_physical_precise_round(output_scale);
+
+        // Graphic scale: the wrapper magnifies the bitmap by the view factor; the hotspot
+        // offset is pre-scaled so the magnified tip lands on `tip` (v3 place_cursor).
+        let scale_cursor = self.config.borrow().cursor.scale_with_view;
+        let graphic_scale = if scale_cursor { view.factor } else { 1.0 };
+        let view = if scale_cursor {
+            view
+        } else {
+            OutputViewport::identity()
+        };
+        // let filter = view_filter(view.factor, self.config.borrow().zoom.filter_threshold);
 
         match render_cursor {
             RenderCursor::Hidden => (),
             RenderCursor::Surface { surface, hotspot } => {
-                let pointer_pos =
-                    (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
+                let offset = hotspot.to_f64().upscale(graphic_scale);
+                let position = (tip - offset).to_physical_precise_round(output_scale);
 
                 push_elements_from_surface_tree(
                     renderer,
                     &surface,
-                    pointer_pos,
+                    anchor,
                     output_scale,
                     1.,
                     Kind::Cursor,
-                    &mut |elem| push(elem.into()),
+                    &mut |elem| {
+                        let elem = RescaleRenderElement::from_element(
+                            RelocateRenderElement::from_element(elem, position, Relocate::Absolute),
+                            position,
+                            view.factor,
+                        );
+                        push(elem.into())
+                    },
                 );
             }
             RenderCursor::Named {
@@ -4039,20 +4638,32 @@ impl Niri {
             } => {
                 let (idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
                 let hotspot = XCursor::hotspot(frame).to_logical(scale);
-                let pointer_pos =
-                    (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
+                let offset = hotspot.to_f64().upscale(graphic_scale);
+                let position = (tip - offset).to_physical_precise_round(output_scale);
 
                 let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
+
                 match MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
-                    pointer_pos,
+                    anchor.to_f64(),
                     &texture,
                     None,
                     None,
                     None,
                     Kind::Cursor,
                 ) {
-                    Ok(element) => push(element.into()),
+                    Ok(element) => {
+                        let element = RescaleRenderElement::from_element(
+                            RelocateRenderElement::from_element(
+                                element,
+                                position,
+                                Relocate::Absolute,
+                            ),
+                            position,
+                            view.factor,
+                        );
+                        push(element.into())
+                    }
                     Err(err) => {
                         warn!("error importing a cursor texture: {err:?}");
                     }
@@ -4061,16 +4672,24 @@ impl Niri {
         }
 
         if let Some(dnd_icon) = self.dnd_icon.as_ref() {
-            let pointer_pos =
-                (pointer_pos + dnd_icon.offset.to_f64()).to_physical_precise_round(output_scale);
+            let offset = dnd_icon.offset.to_f64().upscale(graphic_scale);
+            let position = (tip + offset).to_physical_precise_round(output_scale);
+
             push_elements_from_surface_tree(
                 renderer,
                 &dnd_icon.surface,
-                pointer_pos,
+                anchor,
                 output_scale,
                 1.,
                 Kind::ScanoutCandidate,
-                &mut |elem| push(elem.into()),
+                &mut |elem| {
+                    let elem = RescaleRenderElement::from_element(
+                        RelocateRenderElement::from_element(elem, position, Relocate::Absolute),
+                        position,
+                        view.factor,
+                    );
+                    push(elem.into())
+                },
             );
         }
     }
@@ -4363,19 +4982,35 @@ impl Niri {
     pub fn advance_animations(&mut self) {
         let _span = tracy_client::span!("Niri::advance_animations");
 
+        if let Some(batch) = &mut self.deferred_input_batch {
+            if batch.advance_done {
+                return;
+            }
+            batch.advance_done = true;
+        }
+
         self.layout.advance_animations();
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
 
-        for state in self.output_state.values_mut() {
+        let manipulated = self.zoom_pointer_is_manipulated();
+        let owner = self
+            .pointer_provenance_snapshot()
+            .map(|provenance| provenance.output);
+        for (output, state) in &mut self.output_state {
             if let Some(transition) = &mut state.screen_transition {
                 if transition.is_done() {
                     state.screen_transition = None;
                 }
             }
+            if manipulated && owner.as_ref() == Some(output) {
+                state.update_zoom(ZoomAction::Interrupt);
+            }
+            state.update_zoom(ZoomAction::Advance);
         }
+        self.sync_zoom_cursor();
     }
 
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
@@ -4457,14 +5092,52 @@ impl Niri {
         }
     }
 
+    /// The output viewport through which contents mapped to the output are presented, sampled at
+    /// the moment of the call.
+    ///
+    /// Returns the last committed displayed zoom values, without sampling the clock.
+    pub fn output_view(&self, output: &Output) -> OutputViewport {
+        let zoom_state = self.output_state[output].zoom();
+        zoom_state.view()
+    }
+
+    pub fn screen_to_content_global(
+        &self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let origin = self
+            .global_space
+            .output_geometry(output)
+            .unwrap()
+            .loc
+            .to_f64();
+        self.output_view(output).screen_to_content(pos - origin) + origin
+    }
+
+    pub fn content_to_screen_global(
+        &self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let origin = self
+            .global_space
+            .output_geometry(output)
+            .unwrap()
+            .loc
+            .to_f64();
+        self.output_view(output).content_to_screen(pos - origin) + origin
+    }
+
     pub fn render_to_vec<R: NiriRenderer>(
         &self,
         ctx: RenderCtx<R>,
         output: &Output,
         include_pointer: bool,
+        view: OutputViewport,
     ) -> Vec<OutputRenderElements<R>> {
         let mut elements = Vec::new();
-        self.render(ctx, output, include_pointer, &mut |elem| {
+        self.render(ctx, output, include_pointer, view, &mut |elem| {
             elements.push(elem)
         });
         elements
@@ -4475,6 +5148,7 @@ impl Niri {
         mut ctx: RenderCtx<R>,
         output: &Output,
         include_pointer: bool,
+        view: OutputViewport,
         push: &mut dyn FnMut(OutputRenderElements<R>),
     ) {
         let _span = tracy_client::span!("Niri::render");
@@ -4495,7 +5169,23 @@ impl Niri {
         let state = self.output_state.get(output).unwrap();
         ctx.xray = Some(&state.xray);
 
-        self.render_inner(ctx, output, include_pointer, push);
+        let filter = view_filter(view.factor, self.config.borrow().zoom.filter_threshold);
+
+        let _ = ctx.renderer.upscale_filter(filter);
+        let _ = ctx.renderer.downscale_filter(filter);
+
+        let push = &mut move |elem| {
+            let elem = view_elements(elem, output, view);
+            if self.debug_draw_opaque_regions {
+                push_opaque_regions(
+                    &elem,
+                    Scale::from(output.current_scale().fractional_scale()),
+                    push,
+                );
+            }
+            push(elem);
+        };
+        self.render_inner(ctx, output, include_pointer, view, push);
 
         self.clear_xray_elements(output);
     }
@@ -4505,23 +5195,15 @@ impl Niri {
         mut ctx: RenderCtx<R>,
         output: &Output,
         include_pointer: bool,
+        view: OutputViewport,
         push: &mut dyn FnMut(OutputRenderElements<R>),
     ) {
         let state = self.output_state.get(output).unwrap();
         let output_scale = Scale::from(output.current_scale().fractional_scale());
 
-        let push = if self.debug_draw_opaque_regions {
-            &mut move |elem| {
-                push_opaque_regions(&elem, output_scale, push);
-                push(elem);
-            }
-        } else {
-            push
-        };
-
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
-            self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
+            self.render_pointer(ctx.renderer, output, view, &mut |elem| push(elem.into()));
         }
 
         // Next, the screen transition texture.
@@ -4603,7 +5285,7 @@ impl Niri {
 
         // Get monitor elements.
         let mon = self.layout.monitor_for_output(output).unwrap();
-        let zoom = mon.overview_zoom();
+        let overview_zoom = mon.overview_zoom();
 
         // Get layer-shell elements.
         let layer_map = layer_map_for_output(output);
@@ -4702,7 +5384,9 @@ impl Niri {
             macro_rules! process {
                 ($geo:expr) => {{
                     &mut |elem| {
-                        if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, $geo) {
+                        if let Some(elem) =
+                            scale_relocate_crop(elem, output_scale, overview_zoom, $geo)
+                        {
                             push(elem.into());
                         }
                     }
@@ -4711,7 +5395,7 @@ impl Niri {
 
             for (ws, geo) in mon.workspaces_with_render_geo() {
                 let ns = Some(ws.id().get() as usize);
-                let xray_pos = XrayPos::new(geo.loc, zoom);
+                let xray_pos = XrayPos::new(geo.loc, overview_zoom);
                 push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
             }
@@ -4728,7 +5412,7 @@ impl Niri {
                 // namespace on the frame at once. Id + namespace is used as the cache key in the
                 // damage tracker.
                 let ns = Some(ws.id().get() as usize);
-                let xray_pos = XrayPos::new(geo.loc, zoom);
+                let xray_pos = XrayPos::new(geo.loc, overview_zoom);
                 push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
                 push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
@@ -4926,6 +5610,9 @@ impl Niri {
                     .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
                     .any(|mapped| mapped.are_animations_ongoing());
             }
+
+            // Also check output zoom state for zoom animations
+            state.unfinished_animations_remain |= state.zoom().are_animations_ongoing();
 
             // Render.
             res = backend.render(self, output, target_presentation_time);
@@ -5606,11 +6293,20 @@ impl Niri {
                     };
                     let offset = screencopy.region_loc().upscale(-1);
                     let mut elements = Vec::new();
-                    self.render(ctx, output, screencopy.overlay_cursor(), &mut |elem| {
-                        let elem =
-                            RelocateRenderElement::from_element(elem, offset, Relocate::Relative);
-                        elements.push(elem);
-                    });
+                    self.render(
+                        ctx,
+                        output,
+                        screencopy.overlay_cursor(),
+                        self.output_view(output),
+                        &mut |elem| {
+                            let elem = RelocateRenderElement::from_element(
+                                elem,
+                                offset,
+                                Relocate::Relative,
+                            );
+                            elements.push(elem);
+                        },
+                    );
 
                     let (damages, states) = Self::damage_screencopy_internal(
                         output,
@@ -5684,10 +6380,16 @@ impl Niri {
         };
         let offset = screencopy.region_loc().upscale(-1);
         let mut elements = Vec::new();
-        self.render(ctx, output, screencopy.overlay_cursor(), &mut |elem| {
-            let elem = RelocateRenderElement::from_element(elem, offset, Relocate::Relative);
-            elements.push(elem);
-        });
+        self.render(
+            ctx,
+            output,
+            screencopy.overlay_cursor(),
+            self.output_view(output),
+            &mut |elem| {
+                let elem = RelocateRenderElement::from_element(elem, offset, Relocate::Relative);
+                elements.push(elem);
+            },
+        );
 
         let Some(damage_tracker) = self.screencopy_state.damage_tracker(manager) else {
             error!("screencopy queue must not be deleted as long as frames exist");
@@ -5770,9 +6472,15 @@ impl Niri {
                     xray: None,
                 };
                 let mut elements = Vec::new();
-                self.render(ctx, output, draw_cursor, &mut |elem| {
-                    elements.push(elem);
-                });
+                self.render(
+                    ctx,
+                    output,
+                    draw_cursor,
+                    self.output_view(output),
+                    &mut |elem| {
+                        elements.push(elem);
+                    },
+                );
                 elements
             });
 
@@ -6064,8 +6772,12 @@ impl Niri {
             // Unlike frame damage, the position is in transformed buffer coordinates, i.e. the
             // displayed orientation, so the output transform is not undone here. This matches
             // wlroots.
-            let pos: Point<i32, Physical> =
-                (pointer_pos - geo.loc.to_f64()).to_physical_precise_round(scale);
+            //
+            // The contents render magnified through the view, so the stored content-space
+            // pointer must be mapped forward to screen to match what was rendered.
+            let pos: Point<i32, Physical> = (self.content_to_screen_global(&output, pointer_pos)
+                - geo.loc.to_f64())
+            .to_physical_precise_round(scale);
 
             // Cursors are considered to have entered if any part of the image
             // intersects the output, not just the hotspot, so the position may
@@ -6201,7 +6913,7 @@ impl Niri {
                     target,
                     xray: None,
                 };
-                let elements = self.render_to_vec(ctx, &output, false);
+                let elements = self.render_to_vec(ctx, &output, false, self.output_view(&output));
                 let elements = elements.iter().rev();
 
                 let res = render_to_texture(
@@ -6223,7 +6935,12 @@ impl Niri {
                 // show the pointer even when it's hidden through cursor {} options. The user can
                 // then toggle it in the screenshot UI as needed.
                 if self.pointer_visibility != PointerVisibility::Disabled {
-                    self.render_pointer(renderer, &output, &mut |elem| pointer.push(elem));
+                    self.render_pointer(
+                        renderer,
+                        &output,
+                        self.output_view(&output),
+                        &mut |elem| pointer.push(elem),
+                    );
                 }
 
                 let res_pointer = if pointer.is_empty() {
@@ -6283,7 +7000,7 @@ impl Niri {
             target: RenderTarget::ScreenCapture,
             xray: None,
         };
-        let elements = self.render_to_vec(ctx, output, include_pointer);
+        let elements = self.render_to_vec(ctx, output, include_pointer, self.output_view(output));
         let elements = elements.iter().rev();
         let pixels = render_to_vec(
             renderer,
@@ -6325,7 +7042,9 @@ impl Niri {
                 // Pointer elements are at output-local physical coords.
                 // Relocate by -win_pos to make them window-relative.
                 let pos = win_pos.to_physical_precise_round(scale).upscale(-1);
-                self.render_pointer(renderer, output, &mut |elem| {
+                // The captured window draws 1:1, so anchor the cursor at identity, not through the
+                // view.
+                self.render_pointer(renderer, output, OutputViewport::identity(), &mut |elem| {
                     let elem = RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
                     elements.push(elem.into());
                 });
@@ -6516,7 +7235,8 @@ impl Niri {
                 target: RenderTarget::ScreenCapture,
                 xray: None,
             };
-            let elements = self.render_to_vec(ctx, output, include_pointer);
+            let elements =
+                self.render_to_vec(ctx, output, include_pointer, self.output_view(output));
 
             let (texture, _sync) = render_to_texture(
                 renderer,
@@ -7056,7 +7776,8 @@ impl Niri {
                         target,
                         xray: None,
                     };
-                    let elements = self.render_to_vec(ctx, &output, false);
+                    let elements =
+                        self.render_to_vec(ctx, &output, false, self.output_view(&output));
                     let elements = elements.iter().rev();
 
                     let res = render_to_texture(
@@ -7292,10 +8013,48 @@ fn scale_relocate_crop<E: Element>(
     CropRenderElement::from_element(elem, output_scale, ws_geo)
 }
 
+fn view_elements<R: NiriRenderer>(
+    element: OutputRenderElements<R>,
+    output: &Output,
+    view: OutputViewport,
+) -> OutputRenderElements<R> {
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    macro_rules! view_variants {
+        ($($variant:ident), *) => {
+            match element {
+                $(
+                    OutputRenderElements::$variant(elem) => {
+                        let e = ViewElement::from_element(
+                            elem,
+                            view,
+                            Scale::from(scale),
+                            None,
+                        );
+                        ViewportRenderElements::$variant(e).into()
+                    }
+                )*
+                _ => element,
+            }
+        }
+    }
+
+    view_variants!(
+        Monitor,
+        RescaledTile,
+        LayerSurface,
+        RelocatedLayerSurface,
+        RelocatedColor,
+        Wayland,
+        SolidColor
+    )
+}
+
 niri_render_elements! {
     PointerRenderElements<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
         NamedPointer = MemoryRenderBufferRenderElement<R>,
+        RelocatedWayland = RescaleRenderElement<RelocateRenderElement<WaylandSurfaceRenderElement<R>>>,
+        RelocatedNamedPointer = RescaleRenderElement<RelocateRenderElement<MemoryRenderBufferRenderElement<R>>>,
     }
 }
 
@@ -7303,6 +8062,23 @@ niri_render_elements! {
     WindowScreenshotRenderElement<R> => {
         Layout = LayoutElementRenderElement<R>,
         Pointer = RelocateRenderElement<PointerRenderElements<R>>,
+    }
+}
+
+niri_render_elements! {
+    ViewportRenderElements<R> => {
+        Monitor = ViewElement<MonitorRenderElement<R>>,
+        RescaledTile = ViewElement<RescaleRenderElement<TileRenderElement<R>>>,
+        LayerSurface = ViewElement<LayerSurfaceRenderElement<R>>,
+        RelocatedLayerSurface = ViewElement<CropRenderElement<
+            RelocateRenderElement<RescaleRenderElement<LayerSurfaceRenderElement<R>>>
+        >>,
+        RelocatedColor = ViewElement<CropRenderElement<
+            RelocateRenderElement<RescaleRenderElement<SolidColorRenderElement>>
+        >>,
+        // Pointer is not included here because it's handled directly in it's render path.
+        Wayland = ViewElement<WaylandSurfaceRenderElement<R>>,
+        SolidColor = ViewElement<SolidColorRenderElement>,
     }
 }
 
@@ -7324,6 +8100,7 @@ niri_render_elements! {
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
+        Viewport = ViewportRenderElements<R>,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
     }

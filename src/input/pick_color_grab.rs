@@ -38,6 +38,7 @@ impl PickColorGrab {
     fn pick_color_at_point(location: Point<f64, Logical>, data: &mut State) -> Option<PickedColor> {
         let (output, pos_within_output) = data.niri.output_under(location)?;
         let output = output.clone();
+        let view = data.niri.output_view(&output);
 
         data.backend
             .with_primary_renderer(|renderer| {
@@ -46,7 +47,9 @@ impl PickColorGrab {
                 let scale = Scale::from(output.current_scale().fractional_scale());
                 // FIXME: perhaps replace floor with round once we figure out the pointer behavior
                 // at the bottom/right edges of the monitors.
-                let pos = pos_within_output.to_physical_precise_floor(scale);
+                let pos = view
+                    .content_to_screen(pos_within_output)
+                    .to_physical_precise_floor(scale);
                 let size = Size::<i32, Physical>::from((1, 1));
 
                 let ctx = RenderCtx {
@@ -55,7 +58,7 @@ impl PickColorGrab {
                     target: RenderTarget::Output,
                     xray: None,
                 };
-                let elements = data.niri.render_to_vec(ctx, &output, false);
+                let elements = data.niri.render_to_vec(ctx, &output, false, view);
 
                 let mapping = match render_and_download(
                     renderer,

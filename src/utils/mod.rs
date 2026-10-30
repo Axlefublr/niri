@@ -44,6 +44,7 @@ pub mod signals;
 pub mod spawning;
 pub mod transaction;
 pub mod vblank_throttle;
+pub mod view;
 pub mod watcher;
 pub mod xwayland;
 
@@ -165,11 +166,11 @@ pub fn get_monotonic_time() -> Duration {
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
-pub fn center(rect: Rectangle<i32, Logical>) -> Point<i32, Logical> {
+pub fn center<C>(rect: Rectangle<i32, C>) -> Point<i32, C> {
     rect.loc + rect.size.downscale(2).to_point()
 }
 
-pub fn center_f64(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
+pub fn center_f64<C>(rect: Rectangle<f64, C>) -> Point<f64, C> {
     rect.loc + rect.size.downscale(2.0).to_point()
 }
 

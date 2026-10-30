@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -476,6 +476,41 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let state = ctx.event_stream_state.borrow();
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
+        }
+        Request::ZoomState { output } => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let zooms = state
+                    .niri
+                    .layout
+                    .outputs()
+                    .map(|output| {
+                        let zoom_state = &state.niri.output_state[output].zoom;
+                        let level = zoom_state.view().factor;
+                        (
+                            output.name().clone(),
+                            niri_ipc::Zoom {
+                                is_locked: zoom_state.locked(),
+                                level,
+                                transitioning: zoom_state.is_transitioning(),
+                            },
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+
+                let _ = tx.send_blocking(zooms);
+            });
+            let result = rx.recv().await;
+            let zooms = result.map_err(|_| String::from("error getting zoom state"))?;
+            if let Some(output) = output {
+                let zoom = zooms
+                    .get_key_value(&output)
+                    .map(|(name, zoom)| (name.clone(), zoom.clone()))
+                    .ok_or_else(|| format!("output not found: {output}"))?;
+                Response::ZoomState(HashMap::from([zoom]))
+            } else {
+                Response::ZoomState(zooms)
+            }
         }
     };
 
@@ -999,6 +1034,45 @@ impl State {
         let event = Event::TouchpadToggled { on };
         state.apply(event.clone());
         server.send_event(event);
+    }
+
+    pub fn ipc_refresh_zoom(&mut self) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        let _span = tracy_client::span!("State::ipc_refresh_zoom");
+
+        let mut state = server.event_stream_state.borrow_mut();
+        let state = &mut state.zoom;
+
+        let mut events = Vec::new();
+        let mut seen = HashSet::new();
+
+        for output in self.niri.layout.outputs() {
+            let zoom_state = self.niri.output_state[output].zoom();
+            let output_name = output.name().clone();
+
+            seen.insert(output_name.clone());
+            let zoom = niri_ipc::Zoom {
+                is_locked: zoom_state.locked(),
+                level: zoom_state.view().factor,
+                transitioning: zoom_state.is_transitioning(),
+            };
+
+            if state.should_emit_zoom_event(&output_name, &zoom) {
+                events.push(Event::ZoomChanged {
+                    output: output_name,
+                    state: zoom,
+                });
+            }
+        }
+        state.outputs.retain(|name, _| seen.contains(name));
+
+        for event in events {
+            state.apply(event.clone());
+            server.send_event(event);
+        }
     }
 
     pub fn ipc_config_loaded(&mut self, failed: bool) {
